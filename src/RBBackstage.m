@@ -18,6 +18,8 @@
 #import "RB.h"
 #import <objc/runtime.h>
 #import <objc/message.h>
+#import <signal.h>
+#import <errno.h>
 
 #pragma mark - 私有接口声明（只声明，不链接头文件）
 
@@ -73,33 +75,66 @@
 - (void)invalidate;
 @end
 
+#pragma mark - 安全调用小工具
+
+static id RBMsg0(id obj, NSString *selName) {
+    if (!obj) return nil;
+    SEL s = NSSelectorFromString(selName);
+    if (![obj respondsToSelector:s]) return nil;
+    return ((id (*)(id, SEL))objc_msgSend)(obj, s);
+}
+
+static id RBMsg1(id obj, NSString *selName, id a) {
+    if (!obj) return nil;
+    SEL s = NSSelectorFromString(selName);
+    if (![obj respondsToSelector:s]) return nil;
+    return ((id (*)(id, SEL, id))objc_msgSend)(obj, s, a);
+}
+
+static BOOL RBIsAlive(pid_t pid) {
+    if (pid <= 0) return NO;
+    return kill(pid, 0) == 0 || errno == EPERM;
+}
+
 #pragma mark - hook：让挂上来的 scene 窗口盖在正常层级之上
 //
-//  注意：这里不能给 UIRootSceneWindow 写 @implementation —— 那个类由 UIKit 提供，
-//  自己实现一个同名类会和系统类打架（甚至把系统类顶掉）。用「替身类交换 IMP」的写法：
-//  把替身类上的方法实现换给系统类，替身类本身不会被实例化。
+//  这里不能给 UIRootSceneWindow 写 @implementation —— 那个类由 UIKit 提供，
+//  自己实现一个同名类会和系统类打架。
+//  也不能简单 method_exchangeImplementations：windowLevel / _canShowWhileLocked 如果
+//  是 UIRootSceneWindow 从 UIWindow 继承来的，class_getInstanceMethod 返回的是
+//  父类的方法，换 IMP 等于把整个进程所有 UIWindow 的层级都改了（弹窗、键盘一起遭殃）。
+//  正确做法：先 class_addMethod 给子类补一份自己的实现；只有子类本来就实现了，
+//  才动它自己的 IMP。这样影响范围严格限制在 UIRootSceneWindow 实例上。
 
-@interface RBSceneWindowHook : NSObject
-- (double)rb_windowLevel;
-- (BOOL)rb_canShowWhileLocked;
-@end
+static double RBHookWindowLevel(id self, SEL _cmd) { return 10000000.0; }
+static BOOL   RBHookCanShowWhileLocked(id self, SEL _cmd) { return YES; }
 
-@implementation RBSceneWindowHook
-- (double)rb_windowLevel { return 10000000.0; }
-- (BOOL)rb_canShowWhileLocked { return YES; }
-@end
+static void RBInstallHookOn(Class cls, NSString *selName, IMP imp, const char *fallbackTypes) {
+    if (!cls) return;
+    SEL sel = NSSelectorFromString(selName);
+
+    Method own = class_getInstanceMethod(cls, sel);
+    const char *types = own ? method_getTypeEncoding(own) : fallbackTypes;
+    if (!types) return;
+
+    if (class_addMethod(cls, sel, imp, types)) return;          // 子类此前只有继承实现
+
+    // 子类自己实现了：直接改它自己的 IMP（不会波及父类）
+    Method m = class_getInstanceMethod(cls, sel);
+    if (m && method_getImplementation(m) != imp) {
+        method_setImplementation(m, imp);
+    }
+}
 
 __attribute__((constructor))
 static void RBInstallSceneWindowHooks(void) {
     Class cls = NSClassFromString(@"UIRootSceneWindow");
-    if (!cls) return;
-    Method m1 = class_getInstanceMethod(cls, @selector(windowLevel));
-    Method m2 = class_getInstanceMethod([RBSceneWindowHook class], @selector(rb_windowLevel));
-    if (m1 && m2) method_exchangeImplementations(m1, m2);
-
-    Method m3 = class_getInstanceMethod(cls, @selector(_canShowWhileLocked));
-    Method m4 = class_getInstanceMethod([RBSceneWindowHook class], @selector(rb_canShowWhileLocked));
-    if (m3 && m4) method_exchangeImplementations(m3, m4);
+    if (!cls) {
+        RBLog(@"UIRootSceneWindow 不存在，跳过层级 hook（iOS 版本差异）");
+        return;
+    }
+    RBInstallHookOn(cls, @"windowLevel", (IMP)RBHookWindowLevel, "d16@0:8");
+    RBInstallHookOn(cls, @"_canShowWhileLocked", (IMP)RBHookCanShowWhileLocked, "B16@0:8");
     RBLog(@"scene 窗口层级 hook 已安装：%@", cls);
 }
 
@@ -108,6 +143,7 @@ static void RBInstallSceneWindowHooks(void) {
 @interface RBBackstage ()
 @property (nonatomic, strong) NSMutableDictionary<NSString *, id> *scenes;      // bid -> FBScene
 @property (nonatomic, strong) NSMutableDictionary<NSString *, id> *assertions;  // bid -> RBSAssertion
+@property (nonatomic, strong) NSMutableDictionary<NSString *, NSNumber *> *pids; // bid -> pid
 @property (nonatomic, strong) id binder;
 @end
 
@@ -124,6 +160,7 @@ static void RBInstallSceneWindowHooks(void) {
     if ((self = [super init])) {
         _scenes = [NSMutableDictionary dictionary];
         _assertions = [NSMutableDictionary dictionary];
+        _pids = [NSMutableDictionary dictionary];
     }
     return self;
 }
@@ -136,10 +173,11 @@ static void RBInstallSceneWindowHooks(void) {
         return nil;
     }
     @try {
-        id config = nil;
-        Class screenCls = NSClassFromString(@"UIScreen");
-        if ([screenCls respondsToSelector:NSSelectorFromString(@"displayConfiguration")]) {
-            config = ((id (*)(id, SEL))objc_msgSend)([UIScreen mainScreen], NSSelectorFromString(@"displayConfiguration"));
+        id screen = [UIScreen mainScreen];
+        id config = RBMsg0(screen, @"displayConfiguration") ?: RBMsg0(screen, @"_displayConfiguration");
+        if (!config) {
+            RBLog(@"取不到 displayConfiguration，binder 不创建");
+            return nil;
         }
         SEL initSel = NSSelectorFromString(@"initWithPriority:displayConfiguration:");
         if ([cls instancesRespondToSelector:initSel]) {
@@ -153,16 +191,26 @@ static void RBInstallSceneWindowHooks(void) {
     return self.binder;
 }
 
+/// 已记录的目标进程如果已经退出（用户手动杀了 / 系统回收了），旧 scene 就是死的，
+/// 必须先清掉再重新挂，否则 isEnabled 会一直返回 YES 但实际没保护。
+- (void)dropIfStale:(NSString *)bundleID {
+    NSNumber *p = self.pids[bundleID];
+    if (!p) return;
+    if (RBIsAlive((pid_t)p.intValue)) return;
+    RBLog(@"目标进程已退出，清理旧记录：%@", bundleID);
+    [self disableForBundle:bundleID];
+}
+
 - (BOOL)enableForBundle:(NSString *)bundleID pid:(pid_t)pid error:(NSError **)error {
     if (bundleID.length == 0) return NO;
+    [self dropIfStale:bundleID];
     if (self.scenes[bundleID] || self.assertions[bundleID]) return YES;
 
-    if ([self attachSceneFor:bundleID]) {
-        RBLog(@"真后台(scene) 已挂载：%@", bundleID);
-        return YES;
-    }
-    if ([self acquireAssertionFor:bundleID pid:pid]) {
-        RBLog(@"真后台(assertion) 已保活：%@", bundleID);
+    BOOL ok = [self attachSceneFor:bundleID];
+    if (!ok) ok = [self acquireAssertionFor:bundleID pid:pid];
+
+    if (ok) {
+        self.pids[bundleID] = @(pid > 0 ? pid : [[RBProcesses runningPids][bundleID] intValue]);
         return YES;
     }
     if (error) {
@@ -181,41 +229,46 @@ static void RBInstallSceneWindowHooks(void) {
     Class specCls = NSClassFromString(@"UIApplicationSceneSpecification");
     Class setCls = NSClassFromString(@"UIMutableApplicationSceneSettings");
     Class csetCls = NSClassFromString(@"UIMutableApplicationSceneClientSettings");
-    if (!defCls || !mgrCls || !specCls) {
+    if (!defCls || !mgrCls || !specCls || !parCls) {
         RBLog(@"FrontBoard scene 相关类缺失");
         return NO;
     }
 
+    id scene = nil;
     @try {
         NSString *sceneID = [NSString stringWithFormat:@"realbg.%@", bundleID];
 
-        id def = ((id (*)(id, SEL))objc_msgSend)(defCls, NSSelectorFromString(@"definition"));
+        id def = RBMsg0(defCls, @"definition");
         if (!def) return NO;
-        [def setValue:((id (*)(id, SEL, id))objc_msgSend)(idCls, NSSelectorFromString(@"identityForIdentifier:"), sceneID)
-               forKey:@"identity"];
-        [def setValue:((id (*)(id, SEL, id))objc_msgSend)(cidCls, NSSelectorFromString(@"identityForEmbeddedApplicationIdentifier:"), bundleID)
+        [def setValue:RBMsg1(idCls, @"identityForIdentifier:", sceneID) forKey:@"identity"];
+        [def setValue:RBMsg1(cidCls, @"identityForEmbeddedApplicationIdentifier:", bundleID)
                forKey:@"clientIdentity"];
-        id spec = ((id (*)(id, SEL))objc_msgSend)(specCls, NSSelectorFromString(@"specification"));
+        id spec = RBMsg0(specCls, @"specification");
+        if (!spec) {
+            RBLog(@"UIApplicationSceneSpecification 取不到");
+            return NO;
+        }
         [def setValue:spec forKey:@"specification"];
 
-        id params = ((id (*)(id, SEL, id))objc_msgSend)(parCls, NSSelectorFromString(@"parametersForSpecification:"), spec);
+        id params = RBMsg1(parCls, @"parametersForSpecification:", spec);
         if (!params) return NO;
 
         // settings：让它以「前台」姿态运行，并忽略遮挡导致的降级
         if (setCls) {
-            id settings = ((id (*)(id, SEL))objc_msgSend)(((id (*)(id, SEL))objc_msgSend)(setCls, @selector(alloc)), @selector(init));
+            id settings = RBMsg0(RBMsg0(setCls, @"alloc"), @"init");
             @try { [settings setValue:@YES forKey:@"foreground"]; } @catch (NSException *e) {}
             @try { [settings setValue:@YES forKey:@"ignoreOcclusionReasons"]; } @catch (NSException *e) {}
             @try { [settings setValue:@(0) forKey:@"interfaceOrientation"]; } @catch (NSException *e) {}
             if (settings) [params setValue:settings forKey:@"settings"];
         }
         if (csetCls) {
-            id cs = ((id (*)(id, SEL))objc_msgSend)(((id (*)(id, SEL))objc_msgSend)(csetCls, @selector(alloc)), @selector(init));
+            id cs = RBMsg0(RBMsg0(csetCls, @"alloc"), @"init");
             if (cs) [params setValue:cs forKey:@"clientSettings"];
         }
 
-        id mgr = ((id (*)(id, SEL))objc_msgSend)(mgrCls, NSSelectorFromString(@"sharedInstance"));
-        id scene = ((id (*)(id, SEL, id, id))objc_msgSend)(
+        id mgr = RBMsg0(mgrCls, @"sharedInstance");
+        if (!mgr) return NO;
+        scene = ((id (*)(id, SEL, id, id))objc_msgSend)(
             mgr, NSSelectorFromString(@"createSceneWithDefinition:initialParameters:"), def, params);
         if (!scene) {
             RBLog(@"createScene 返回 nil：%@", bundleID);
@@ -224,16 +277,32 @@ static void RBInstallSceneWindowHooks(void) {
 
         id binder = [self ensureBinder];
         if (!binder || ![binder respondsToSelector:NSSelectorFromString(@"addScene:")]) {
-            RBLog(@"binder 不可用，scene 无法上屏");
+            RBLog(@"binder 不可用，scene 无法上屏（回收刚创建的 scene）");
+            [self destroyScene:scene];          // 不回收就是一条泄漏的 scene
             return NO;
         }
         ((void (*)(id, SEL, id))objc_msgSend)(binder, NSSelectorFromString(@"addScene:"), scene);
 
         self.scenes[bundleID] = scene;
+        RBLog(@"真后台(scene) 已挂载：%@", bundleID);
         return YES;
     } @catch (NSException *e) {
         RBLog(@"scene 方案异常：%@ %@", e.name, e.reason);
+        if (scene) [self destroyScene:scene];
         return NO;
+    }
+}
+
+- (void)destroyScene:(id)scene {
+    Class mgrCls = NSClassFromString(@"FBSceneManager");
+    id mgr = RBMsg0(mgrCls, @"sharedInstance");
+    if (!mgr) return;
+    SEL sel = NSSelectorFromString(@"destroyScene:withTransitionContext:");
+    if (![mgr respondsToSelector:sel]) return;
+    @try {
+        ((void (*)(id, SEL, id, id))objc_msgSend)(mgr, sel, scene, nil);
+    } @catch (NSException *e) {
+        RBLog(@"销毁 scene 异常：%@", e.reason);
     }
 }
 
@@ -263,6 +332,7 @@ static void RBInstallSceneWindowHooks(void) {
             assertion, NSSelectorFromString(@"acquireWithError:"), &err);
         if (ok) {
             self.assertions[bundleID] = assertion;
+            RBLog(@"真后台(assertion) 已保活：%@", bundleID);
         } else {
             RBLog(@"assertion 获取失败：%@", err.localizedDescription);
         }
@@ -276,17 +346,13 @@ static void RBInstallSceneWindowHooks(void) {
 - (void)disableForBundle:(NSString *)bundleID {
     id scene = self.scenes[bundleID];
     if (scene) {
-        @try {
-            id binder = self.binder;
-            if (binder && [binder respondsToSelector:NSSelectorFromString(@"removeScene:")]) {
+        id binder = self.binder;
+        if (binder && [binder respondsToSelector:NSSelectorFromString(@"removeScene:")]) {
+            @try {
                 ((void (*)(id, SEL, id))objc_msgSend)(binder, NSSelectorFromString(@"removeScene:"), scene);
-            }
-            Class mgrCls = NSClassFromString(@"FBSceneManager");
-            id mgr = ((id (*)(id, SEL))objc_msgSend)(mgrCls, NSSelectorFromString(@"sharedInstance"));
-            ((void (*)(id, SEL, id, id))objc_msgSend)(mgr, NSSelectorFromString(@"destroyScene:withTransitionContext:"), scene, nil);
-        } @catch (NSException *e) {
-            RBLog(@"销毁 scene 异常：%@", e.reason);
+            } @catch (NSException *e) {}
         }
+        [self destroyScene:scene];
         [self.scenes removeObjectForKey:bundleID];
     }
     id assertion = self.assertions[bundleID];
@@ -295,9 +361,11 @@ static void RBInstallSceneWindowHooks(void) {
         @catch (NSException *e) {}
         [self.assertions removeObjectForKey:bundleID];
     }
+    [self.pids removeObjectForKey:bundleID];
 }
 
 - (BOOL)isEnabledForBundle:(NSString *)bundleID {
+    [self dropIfStale:bundleID];
     return self.scenes[bundleID] != nil || self.assertions[bundleID] != nil;
 }
 

@@ -60,6 +60,10 @@
 + (double)freeMemoryMB;
 /// 当前已用内存（MB）
 + (double)usedMemoryMB;
+/// 单个 pid -> bundleID（不在 /Bundle/Application/ 下返回 nil）
++ (NSString *)bundleIDForPid:(pid_t)pid;
+/// 是不是系统 App（com.apple.* 或本 App 自己）—— 这类一律不杀
++ (BOOL)isSystemBundle:(NSString *)bundleID;
 /// 系统关键进程判断（按可执行名）
 + (BOOL)isProtectedExec:(NSString *)exe;
 + (NSSet *)protectedBundleIDs;
@@ -80,11 +84,11 @@
 
 @interface RBBooster : NSObject
 /// 批量结束后台进程。protect: 不杀的 bundleID（真后台白名单）
-/// 返回 @{@"killed": @(n), @"freedMB": @(x), @"skipped": @(y), @"details": @[...]}
+/// 返回 @{@"killed", @"failed", @"freedMB", @"beforeMB", @"afterMB", @"details"}
 + (NSDictionary *)boostProtecting:(NSSet *)protect;
 /// 预估可释放内存
 + (double)estimatedReclaimMB;
-/// 可清理候选（按占用内存降序），元素：@{bundleID, pid, mb}
+/// 可清理候选（按占用内存降序），元素：@{bundleID, pid, mb, estimated}
 + (NSArray<NSDictionary *> *)candidatesProtecting:(NSSet *)protect;
 /// 单个进程的真实物理占用（phys_footprint，MB）
 + (double)footprintMBForPid:(pid_t)pid;

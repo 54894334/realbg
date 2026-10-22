@@ -59,6 +59,13 @@ static NSSet *RBProtectedBundleIDs(void) {
     return s;
 }
 
+/// 系统 App 一律不动 —— 白名单只能枚举有限个，系统 App 会随 iOS 版本增减，
+/// 按前缀整片拦掉比逐个维护清单可靠。
+static BOOL RBIsSystemBundle(NSString *bid) {
+    if (bid.length == 0) return YES;
+    return [bid hasPrefix:@"com.apple."] || [bid isEqualToString:@"cn.bswbw.RealBG"];
+}
+
 // 绝不能碰的系统守护进程（按可执行文件名判断）
 static NSSet *RBProtectedExecNames(void) {
     static NSSet *s;
@@ -155,6 +162,7 @@ static NSSet *RBProtectedExecNames(void) {
     }
 
     // ② 目录扫描兜底（LS 不可用，或某些 TrollStore 应用 LS 不收录）
+    NSUInteger lsCount = paths.count;
     if (paths.count < 5) {
         NSDictionary *scan = [self scanBundles];
         for (NSString *bid in scan) {
@@ -162,7 +170,7 @@ static NSSet *RBProtectedExecNames(void) {
             if (!names[bid]) names[bid] = scan[bid][@"name"];
         }
         RBLog(@"目录扫描：%lu 个应用（LS 只给了 %lu 个）",
-              (unsigned long)scan.count, (unsigned long)paths.count - scan.count);
+              (unsigned long)scan.count, (unsigned long)lsCount);
     }
 
     NSMutableArray *out = [NSMutableArray array];
@@ -260,6 +268,37 @@ static NSSet *RBProtectedExecNames(void) {
 
 #pragma mark - 进程枚举
 
+/// 单个 pid -> bundleID。不在 /Bundle/Application/ 下（系统守护进程、系统 App）一律返回 nil。
++ (NSString *)bundleIDForPid:(pid_t)pid {
+    if (pid <= 0) return nil;
+
+    char path[PROC_PIDPATHINFO_MAXSIZE];
+    memset(path, 0, sizeof(path));
+    if (proc_pidpath(pid, path, sizeof(path)) <= 0) return nil;
+
+    NSString *exe = [NSString stringWithUTF8String:path];
+    if (exe.length == 0) return nil;                      // 非 UTF8 路径
+    NSRange r = [exe rangeOfString:@"/Bundle/Application/"];
+    if (r.location == NSNotFound) return nil;
+
+    NSString *tail = [exe substringFromIndex:r.location + r.length];
+    NSArray *parts = [tail componentsSeparatedByString:@"/"];
+    if (parts.count < 2) return nil;
+
+    // 从完整路径截出 .../<UUID>/<Name>.app，不硬编码 /private/var 前缀
+    NSRange r2 = [tail rangeOfString:parts[1]];
+    if (r2.location == NSNotFound) return nil;
+    NSString *bundlePath = [exe substringToIndex:r.location + r2.location + r2.length];
+
+    NSDictionary *info = [NSDictionary dictionaryWithContentsOfFile:
+                          [bundlePath stringByAppendingPathComponent:@"Info.plist"]];
+    NSString *bid = [info isKindOfClass:[NSDictionary class]] ? info[@"CFBundleIdentifier"] : nil;
+    if (![bid isKindOfClass:[NSString class]] || bid.length == 0) {
+        bid = parts[1].stringByDeletingPathExtension;
+    }
+    return bid.length ? bid : nil;
+}
+
 + (NSDictionary<NSString *, NSNumber *> *)runningPids {
     NSMutableDictionary *map = [NSMutableDictionary dictionary];
 
@@ -271,32 +310,10 @@ static NSSet *RBProtectedExecNames(void) {
     if (n <= 0) { free(pids); return map; }
     int count = n / (int)sizeof(pid_t);
 
-    char path[PROC_PIDPATHINFO_MAXSIZE];
     for (int i = 0; i < count; i++) {
         pid_t pid = pids[i];
         if (pid <= 0) continue;
-        memset(path, 0, sizeof(path));
-        if (proc_pidpath(pid, path, sizeof(path)) <= 0) continue;
-        NSString *exe = [NSString stringWithUTF8String:path];
-        if (exe.length == 0) continue;
-
-        // /private/var/containers/Bundle/Application/<UUID>/<Name>.app/<Name>
-        NSRange r = [exe rangeOfString:@"/Bundle/Application/"];
-        if (r.location == NSNotFound) continue;
-        NSString *tail = [exe substringFromIndex:r.location + r.length];
-        NSArray *parts = [tail componentsSeparatedByString:@"/"];
-        if (parts.count < 2) continue;
-
-        NSString *appDir = parts[1];                       // Name.app
-        NSString *bundlePath = [NSString stringWithFormat:
-                                @"/private/var/containers/Bundle/Application/%@/%@",
-                                parts[0], appDir];
-        NSDictionary *info = [NSDictionary dictionaryWithContentsOfFile:
-                              [bundlePath stringByAppendingPathComponent:@"Info.plist"]];
-        NSString *bid = info[@"CFBundleIdentifier"];
-        if (![bid isKindOfClass:[NSString class]] || bid.length == 0) {
-            bid = appDir.stringByDeletingPathExtension;
-        }
+        NSString *bid = [self bundleIDForPid:pid];
         if (bid.length) map[bid] = @(pid);
     }
     free(pids);
@@ -305,25 +322,78 @@ static NSSet *RBProtectedExecNames(void) {
 
 #pragma mark - 杀进程
 
+/// RunningBoard 正规终止路径。kill() 只对同 uid 进程有效，遇到跨 uid 或系统托管的
+/// 进程会被 EPERM 挡住；这条走的是 runningboard.terminateprocess 权限，成功率高得多。
+static BOOL RBKillViaRunningBoard(pid_t pid) {
+    Class handleCls = NSClassFromString(@"RBSProcessHandle");
+    if (!handleCls) return NO;
+
+    id handle = nil;
+    SEL sForPid = NSSelectorFromString(@"handleForPid:");
+    SEL sLookup = NSSelectorFromString(@"lookupHandleForPid:error:");
+    @try {
+        if ([handleCls respondsToSelector:sForPid]) {
+            handle = ((id (*)(id, SEL, int))objc_msgSend)(handleCls, sForPid, pid);
+        } else if ([handleCls respondsToSelector:sLookup]) {
+            NSError *err = nil;
+            handle = ((id (*)(id, SEL, int, NSError **))objc_msgSend)(handleCls, sLookup, pid, &err);
+        }
+    } @catch (NSException *e) {
+        return NO;
+    }
+    if (!handle) return NO;
+
+    SEL sTerm = NSSelectorFromString(@"terminateWithExplanation:");
+    if (![handle respondsToSelector:sTerm]) return NO;
+    @try {
+        ((void (*)(id, SEL, id))objc_msgSend)(handle, sTerm, @"RealBG 一键加速");
+        return YES;
+    } @catch (NSException *e) {
+        return NO;
+    }
+}
+
 + (BOOL)killPid:(pid_t)pid {
     if (pid <= 1) return NO;
     if (pid == getpid()) return NO;
+
     if (kill(pid, SIGKILL) == 0) return YES;
     // 没有权限时退回 SIGTERM（个别进程只吃 TERM）
-    if (errno == EPERM) return kill(pid, SIGTERM) == 0;
-    return NO;
+    if (errno == EPERM && kill(pid, SIGTERM) == 0) return YES;
+    // 两条信号都不行，走 RunningBoard
+    return RBKillViaRunningBoard(pid);
 }
 
 + (BOOL)killApp:(NSString *)bundleID pid:(pid_t)pid {
     if (pid <= 1) return NO;
+    if (RBIsSystemBundle(bundleID)) return NO;                  // com.apple.* 一律不动
     if (bundleID.length && [RBProtectedBundleIDs() containsObject:bundleID]) return NO;
+
+    // pid 复用防护：枚举到执行之间进程可能已经退出、pid 被别的进程占用，
+    // 这种情况直接放弃，宁可少杀一个也不误杀。
+    NSString *now = [self bundleIDForPid:pid];
+    if (now.length && bundleID.length && ![now isEqualToString:bundleID]) {
+        RBLog(@"pid %d 已被 %@ 复用，跳过 %@", pid, now, bundleID);
+        return NO;
+    }
     return [self killPid:pid];
 }
 
++ (BOOL)isSystemBundle:(NSString *)bundleID { return RBIsSystemBundle(bundleID); }
+
 #pragma mark - 内存
 
+/// mach_host_self() 每次调用都会多一个 send right，用完不 deallocate 就是慢性泄漏。
+/// 统计内存是每秒都在做的事，这里缓存一个端口反复用。
+static mach_port_t RBHostPort(void) {
+    static mach_port_t host;
+    static dispatch_once_t once;
+    dispatch_once(&once, ^{ host = mach_host_self(); });
+    return host;
+}
+
 + (double)freeMemoryMB {
-    mach_port_t host = mach_host_self();
+    mach_port_t host = RBHostPort();
     vm_size_t pageSize = 0;
     host_page_size(host, &pageSize);
 
@@ -338,7 +408,7 @@ static NSSet *RBProtectedExecNames(void) {
 }
 
 + (double)usedMemoryMB {
-    mach_port_t host = mach_host_self();
+    mach_port_t host = RBHostPort();
     vm_size_t pageSize = 0;
     host_page_size(host, &pageSize);
     vm_statistics64_data_t vmstat;

@@ -4,6 +4,12 @@
 //  布局沿用原版（分段：全部/运行中/真后台/自启 + 搜索 + 左右滑动操作），
 //  底部新增一条「一键加速」。原版没有这个键，它的清内存要一个个 App 点「杀后台」。
 //
+//  这一版修掉的界面层问题：
+//    · 表格数据在刷新瞬间变短时，indexPath 越界会 NSRangeException 崩溃 —— 所有取值加边界判断
+//    · 「一键加速」原来在主线程枚举全系统进程 + 逐个读 Info.plist，会卡住界面 —— 改成后台线程
+//    · 内存标签每次都要重算「可清理」，和刷新重复扫两遍进程 —— 合并成一次
+//    · 弹窗还在展示时又去 present，会出现「already presenting」导致提示直接不显示 —— 统一走 presentAlert:
+//
 #import "RB.h"
 
 static UIColor *RBAccent(void) { return [UIColor colorWithRed:0.16 green:0.78 blue:0.55 alpha:1]; }
@@ -72,8 +78,9 @@ static UIColor *RBWarn(void)   { return [UIColor colorWithRed:1.00 green:0.42 bl
     CGFloat w = self.contentView.bounds.size.width;
     _iconView2.frame = CGRectMake(16, (h - 44) / 2.0, 44, 44);
     CGFloat tx = CGRectGetMaxX(_iconView2.frame) + 12;
-    _nameLabel.frame = CGRectMake(tx, h / 2.0 - 20, w - tx - 96, 22);
-    _bidLabel.frame  = CGRectMake(tx, h / 2.0 + 2, w - tx - 96, 16);
+    CGFloat textW = MAX(40, w - tx - 96);
+    _nameLabel.frame = CGRectMake(tx, h / 2.0 - 20, textW, 22);
+    _bidLabel.frame  = CGRectMake(tx, h / 2.0 + 2, textW, 16);
     _stateLabel.frame = CGRectMake(w - 100, h / 2.0 - 9, 86, 18);
     _spin.frame = CGRectMake(w - 34, (h - 20) / 2.0, 20, 20);
 }
@@ -115,23 +122,32 @@ static UIColor *RBWarn(void)   { return [UIColor colorWithRed:1.00 green:0.42 bl
 @property (nonatomic, strong) NSArray<RBAppInfo *> *shown;
 @property (nonatomic, assign) NSInteger tab;      // 0 全部 1 运行中 2 真后台 3 自启
 @property (nonatomic, copy)   NSString *query;
-@property (nonatomic, assign) BOOL loading;
 
-// 前置声明（避免方法定义顺序导致的隐式声明告警）
+@property (nonatomic, assign) BOOL loading;
+@property (nonatomic, assign) BOOL pendingReload;
+@property (nonatomic, assign) BOOL boostBusy;
+
+@property (nonatomic, assign) double usedMB;
+@property (nonatomic, assign) double freeMB;
+@property (nonatomic, assign) double estimateMB;
+@property (nonatomic, assign) BOOL hasMemory;
+
 - (void)buildSeg;
 - (void)buildTable;
 - (void)buildBoost;
 - (void)buildSearch;
 - (void)reload;
 - (void)applyFilter;
-- (void)refreshMemoryLabel;
+- (void)updateMemoryLabel;
 - (void)segChanged;
 - (void)appDidBecomeActive;
 - (void)toggleBackstage:(RBAppInfo *)info;
 - (void)enableAllRunning;
 - (void)tapBoost;
-- (void)doBoost;
+- (void)doBoostWithCandidates:(NSArray *)cands;
 - (void)toast:(NSString *)s;
+- (void)presentAlert:(UIAlertController *)ac;
+- (void)reloadAfterDelay;
 @end
 
 @implementation RBRootVC
@@ -167,11 +183,10 @@ static UIColor *RBWarn(void)   { return [UIColor colorWithRed:1.00 green:0.42 bl
 
 - (void)viewDidAppear:(BOOL)animated {
     [super viewDidAppear:animated];
-    [self refreshMemoryLabel];
+    [self reload];
 }
 
 - (void)appDidBecomeActive {
-    [self refreshMemoryLabel];
     [self reload];
 }
 
@@ -217,6 +232,7 @@ static UIColor *RBWarn(void)   { return [UIColor colorWithRed:1.00 green:0.42 bl
     self.memLabel = [UILabel new];
     self.memLabel.textColor = [UIColor colorWithWhite:1 alpha:0.6];
     self.memLabel.font = [UIFont systemFontOfSize:12];
+    self.memLabel.text = @"正在读取内存…";
     self.memLabel.translatesAutoresizingMaskIntoConstraints = NO;
     [bar addSubview:self.memLabel];
 
@@ -267,8 +283,12 @@ static UIColor *RBWarn(void)   { return [UIColor colorWithRed:1.00 green:0.42 bl
 #pragma mark 数据
 
 - (void)reload {
-    if (self.loading) return;
+    if (self.loading) {
+        self.pendingReload = YES;
+        return;
+    }
     self.loading = YES;
+
     dispatch_async(dispatch_get_global_queue(QOS_CLASS_USER_INITIATED, 0), ^{
         NSArray *apps = [RBProcesses installedApps];
         NSDictionary *running = [RBProcesses runningPids];
@@ -282,11 +302,30 @@ static UIColor *RBWarn(void)   { return [UIColor colorWithRed:1.00 green:0.42 bl
             i.hasAutoStart = [store.autoStartIDs containsObject:i.bundleID];
             i.hasSuicide = [store.suicideIDs containsObject:i.bundleID];
         }
+
+        // 内存与「可清理」只在这里算一次，别在每次刷新界面时重算
+        double used = [RBProcesses usedMemoryMB];
+        double freeMB = [RBProcesses freeMemoryMB];
+        BOOL hasMemory = (used + freeMB) > 1.0;
+        double est = 0;
+        for (NSDictionary *d in [RBBooster candidatesProtecting:store.backstageIDs]) {
+            est += [d[@"mb"] doubleValue];
+        }
+
         dispatch_async(dispatch_get_main_queue(), ^{
-            self.allApps = apps;
+            self.allApps = [apps copy];
+            self.usedMB = used;
+            self.freeMB = freeMB;
+            self.estimateMB = est;
+            self.hasMemory = hasMemory;
             self.loading = NO;
             [self applyFilter];
-            [self refreshMemoryLabel];
+            [self updateMemoryLabel];
+
+            if (self.pendingReload) {
+                self.pendingReload = NO;
+                [self reload];
+            }
         });
     });
 }
@@ -309,16 +348,18 @@ static UIColor *RBWarn(void)   { return [UIColor colorWithRed:1.00 green:0.42 bl
     [self.tableView reloadData];
 }
 
-- (void)refreshMemoryLabel {
-    dispatch_async(dispatch_get_global_queue(QOS_CLASS_UTILITY, 0), ^{
-        double used = [RBProcesses usedMemoryMB];
-        double freeMB = [RBProcesses freeMemoryMB];
-        double est = [RBBooster estimatedReclaimMB];
-        dispatch_async(dispatch_get_main_queue(), ^{
-            self.memLabel.text = [NSString stringWithFormat:@"已用 %@ · 可用 %@ · 可清理约 %@",
-                                  RBHumanMB(used), RBHumanMB(freeMB), RBHumanMB(est)];
-        });
-    });
+- (void)updateMemoryLabel {
+    if (!self.hasMemory) {
+        self.memLabel.text = @"内存信息读取失败";
+        return;
+    }
+    self.memLabel.text = [NSString stringWithFormat:@"已用 %@ · 可用 %@ · 可清理约 %@",
+                          RBHumanMB(self.usedMB), RBHumanMB(self.freeMB), RBHumanMB(self.estimateMB)];
+}
+
+- (void)reloadAfterDelay {
+    dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(0.35 * NSEC_PER_SEC)),
+                   dispatch_get_main_queue(), ^{ [self reload]; });
 }
 
 - (void)segChanged {
@@ -332,15 +373,22 @@ static UIColor *RBWarn(void)   { return [UIColor colorWithRed:1.00 green:0.42 bl
     return self.shown.count;
 }
 
+- (RBAppInfo *)infoAtIndex:(NSInteger)row {
+    if (row < 0 || (NSUInteger)row >= self.shown.count) return nil;   // 刷新瞬间的越界防护
+    return self.shown[row];
+}
+
 - (UITableViewCell *)tableView:(UITableView *)tableView cellForRowAtIndexPath:(NSIndexPath *)indexPath {
     RBAppCell *c = [tableView dequeueReusableCellWithIdentifier:@"cell" forIndexPath:indexPath];
-    [c bind:self.shown[indexPath.row]];
+    RBAppInfo *info = [self infoAtIndex:indexPath.row];
+    if (info) [c bind:info];
     return c;
 }
 
 - (UISwipeActionsConfiguration *)tableView:(UITableView *)tableView
     leadingSwipeActionsConfigurationForRowAtIndexPath:(NSIndexPath *)indexPath {
-    RBAppInfo *info = self.shown[indexPath.row];
+    RBAppInfo *info = [self infoAtIndex:indexPath.row];
+    if (!info) return nil;
     BOOL on = info.hasBackstage;
     UIContextualAction *a = [UIContextualAction contextualActionWithStyle:UIContextualActionStyleNormal
                                                                     title:(on ? @"关闭真后台" : @"开启真后台")
@@ -354,15 +402,17 @@ static UIColor *RBWarn(void)   { return [UIColor colorWithRed:1.00 green:0.42 bl
 
 - (UISwipeActionsConfiguration *)tableView:(UITableView *)tableView
     trailingSwipeActionsConfigurationForRowAtIndexPath:(NSIndexPath *)indexPath {
-    RBAppInfo *info = self.shown[indexPath.row];
+    RBAppInfo *info = [self infoAtIndex:indexPath.row];
+    if (!info) return nil;
 
     UIContextualAction *kill = [UIContextualAction contextualActionWithStyle:UIContextualActionStyleDestructive
                                                                       title:@"杀后台"
                                                                     handler:^(UIContextualAction *action, UIView *v, void (^done)(BOOL)) {
         if (!info.isRunning) { done(NO); return; }
-        [RBProcesses killApp:info.bundleID pid:info.pid];
-        dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(0.35 * NSEC_PER_SEC)),
-                       dispatch_get_main_queue(), ^{ [self reload]; });
+        if (![RBProcesses killApp:info.bundleID pid:info.pid]) {
+            [self toast:[NSString stringWithFormat:@"%@ 没能结束（系统拒绝）", info.name]];
+        }
+        [self reloadAfterDelay];
         done(YES);
     }];
     kill.backgroundColor = RBWarn();
@@ -384,12 +434,13 @@ static UIColor *RBWarn(void)   { return [UIColor colorWithRed:1.00 green:0.42 bl
 
 - (void)tableView:(UITableView *)tableView didSelectRowAtIndexPath:(NSIndexPath *)indexPath {
     [tableView deselectRowAtIndexPath:indexPath animated:YES];
-    RBAppInfo *info = self.shown[indexPath.row];
+    RBAppInfo *info = [self infoAtIndex:indexPath.row];
+    if (!info) return;
 
     NSString *mem = @"未运行";
     if (info.isRunning) {
         double mb = [RBBooster footprintMBForPid:info.pid];
-        mem = mb > 0 ? [NSString stringWithFormat:@"占用 %@", RBHumanMB(mb)] : @"运行中";
+        mem = mb > 0 ? [NSString stringWithFormat:@"占用 %@", RBHumanMB(mb)] : @"运行中（占用未知）";
     }
     UIAlertController *ac = [UIAlertController
         alertControllerWithTitle:info.name
@@ -404,8 +455,7 @@ static UIColor *RBWarn(void)   { return [UIColor colorWithRed:1.00 green:0.42 bl
         [ac addAction:[UIAlertAction actionWithTitle:@"杀后台" style:UIAlertActionStyleDestructive
                                              handler:^(UIAlertAction *a) {
             [RBProcesses killApp:info.bundleID pid:info.pid];
-            dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(0.35 * NSEC_PER_SEC)),
-                           dispatch_get_main_queue(), ^{ [self reload]; });
+            [self reloadAfterDelay];
         }]];
     }
     [ac addAction:[UIAlertAction actionWithTitle:(info.hasSuicide ? @"取消「切走即杀」" : @"开启「切走即杀」")
@@ -421,7 +471,7 @@ static UIColor *RBWarn(void)   { return [UIColor colorWithRed:1.00 green:0.42 bl
 
     ac.popoverPresentationController.sourceView = tableView;
     ac.popoverPresentationController.sourceRect = [tableView rectForRowAtIndexPath:indexPath];
-    [self presentViewController:ac animated:YES completion:nil];
+    [self presentAlert:ac];
 }
 
 #pragma mark 动作
@@ -471,30 +521,55 @@ static UIColor *RBWarn(void)   { return [UIColor colorWithRed:1.00 green:0.42 bl
 }
 
 - (void)tapBoost {
-    NSArray *cands = [RBBooster candidatesProtecting:[RBStore shared].backstageIDs];
-    if (cands.count == 0) { [self toast:@"没有可清理的后台进程"]; return; }
+    if (self.boostBusy) return;
+    self.boostBusy = YES;
+    self.boostButton.enabled = NO;
+    [self.boostButton setTitle:@"正在统计…" forState:UIControlStateNormal];
 
-    double est = 0;
-    NSMutableString *list = [NSMutableString string];
-    for (NSDictionary *d in cands) {
-        est += [d[@"mb"] doubleValue];
-        if (list.length < 300) {
-            [list appendFormat:@"· %@ %.0f MB\n", d[@"bundleID"], [d[@"mb"] doubleValue]];
-        }
-    }
+    NSSet *protect = [[RBStore shared].backstageIDs copy];
+    dispatch_async(dispatch_get_global_queue(QOS_CLASS_USER_INITIATED, 0), ^{
+        NSArray *cands = [RBBooster candidatesProtecting:protect];
+        dispatch_async(dispatch_get_main_queue(), ^{
+            self.boostBusy = NO;
+            self.boostButton.enabled = YES;
+            [self.boostButton setTitle:@"一键加速" forState:UIControlStateNormal];
 
-    UIAlertController *ac = [UIAlertController
-        alertControllerWithTitle:[NSString stringWithFormat:@"将结束 %lu 个后台进程", (unsigned long)cands.count]
-                         message:[NSString stringWithFormat:@"预计释放约 %@\n\n%@",
-                                  RBHumanMB(est), list]
-                  preferredStyle:UIAlertControllerStyleAlert];
-    [ac addAction:[UIAlertAction actionWithTitle:@"取消" style:UIAlertActionStyleCancel handler:nil]];
-    [ac addAction:[UIAlertAction actionWithTitle:@"开始加速" style:UIAlertActionStyleDestructive
-                                         handler:^(UIAlertAction *a) { [self doBoost]; }]];
-    [self presentViewController:ac animated:YES completion:nil];
+            if (cands.count == 0) {
+                [self toast:@"没有可清理的后台进程（真后台白名单里的、系统 App、8MB 以下的不动）"];
+                return;
+            }
+
+            double est = 0;
+            NSMutableString *list = [NSMutableString string];
+            NSUInteger shown = 0;
+            for (NSDictionary *d in cands) {
+                est += [d[@"mb"] doubleValue];
+                if (shown < 8) {
+                    [list appendFormat:@"· %@ %@%@\n",
+                     d[@"bundleID"],
+                     [d[@"estimated"] boolValue] ? @"~" : @"",
+                     RBHumanMB([d[@"mb"] doubleValue])];
+                    shown++;
+                }
+            }
+            if (cands.count > shown) {
+                [list appendFormat:@"… 另有 %lu 个", (unsigned long)(cands.count - shown)];
+            }
+
+            UIAlertController *ac = [UIAlertController
+                alertControllerWithTitle:[NSString stringWithFormat:@"将结束 %lu 个后台进程", (unsigned long)cands.count]
+                                 message:[NSString stringWithFormat:@"预计释放约 %@\n\n%@", RBHumanMB(est), list]
+                          preferredStyle:UIAlertControllerStyleAlert];
+            [ac addAction:[UIAlertAction actionWithTitle:@"取消" style:UIAlertActionStyleCancel handler:nil]];
+            [ac addAction:[UIAlertAction actionWithTitle:@"开始加速" style:UIAlertActionStyleDestructive
+                                                 handler:^(UIAlertAction *a) { [self doBoostWithCandidates:cands]; }]];
+            [self presentAlert:ac];
+        });
+    });
 }
 
-- (void)doBoost {
+- (void)doBoostWithCandidates:(NSArray *)cands {
+    self.boostBusy = YES;
     self.boostButton.enabled = NO;
     [self.boostButton setTitle:@"正在加速…" forState:UIControlStateNormal];
 
@@ -502,32 +577,51 @@ static UIColor *RBWarn(void)   { return [UIColor colorWithRed:1.00 green:0.42 bl
     dispatch_async(dispatch_get_global_queue(QOS_CLASS_USER_INITIATED, 0), ^{
         NSDictionary *r = [RBBooster boostProtecting:protect];
         dispatch_async(dispatch_get_main_queue(), ^{
+            self.boostBusy = NO;
             self.boostButton.enabled = YES;
             [self.boostButton setTitle:@"一键加速" forState:UIControlStateNormal];
-            [self refreshMemoryLabel];
-            [self reload];
 
-            NSString *msg = [NSString stringWithFormat:@"结束 %@ 个进程，释放 %@\n可用内存 %@ → %@",
+            NSString *msg = [NSString stringWithFormat:@"结束 %@ 个进程，释放 %@\n可用内存 %@ → %@\n失败 %@ 个",
                              r[@"killed"], RBHumanMB([r[@"freedMB"] doubleValue]),
                              RBHumanMB([r[@"beforeMB"] doubleValue]),
-                             RBHumanMB([r[@"afterMB"] doubleValue])];
+                             RBHumanMB([r[@"afterMB"] doubleValue]), r[@"failed"]];
             UIAlertController *ac = [UIAlertController alertControllerWithTitle:@"加速完成"
                                                                        message:msg
                                                                 preferredStyle:UIAlertControllerStyleAlert];
             [ac addAction:[UIAlertAction actionWithTitle:@"好" style:UIAlertActionStyleDefault handler:nil]];
-            [self presentViewController:ac animated:YES completion:nil];
+            [self presentAlert:ac];
+            [self reload];
         });
     });
+}
+
+#pragma mark 弹窗
+
+/// 已经有弹窗在显示时直接 present 会失败（控制台报 already presenting，用户什么也看不到）。
+/// 统一走这里：先关掉在显示的，再弹新的。
+- (void)presentAlert:(UIAlertController *)ac {
+    UIViewController *top = self.presentedViewController;
+    if (top && !top.isBeingDismissed) {
+        [top dismissViewControllerAnimated:NO completion:^{
+            if (!self.presentedViewController) {
+                [self presentViewController:ac animated:YES completion:nil];
+            }
+        }];
+        return;
+    }
+    if (self.view.window == nil) return;      // 不在窗口里就别弹
+    [self presentViewController:ac animated:YES completion:nil];
 }
 
 - (void)toast:(NSString *)s {
     RBLog(@"%@", s);
     UIAlertController *ac = [UIAlertController alertControllerWithTitle:nil message:s
                                                             preferredStyle:UIAlertControllerStyleAlert];
-    [self presentViewController:ac animated:YES completion:^{
-        dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(1.2 * NSEC_PER_SEC)),
-                       dispatch_get_main_queue(), ^{ [ac dismissViewControllerAnimated:YES completion:nil]; });
-    }];
+    [self presentAlert:ac];
+    dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(1.4 * NSEC_PER_SEC)),
+                   dispatch_get_main_queue(), ^{
+        if (ac.presentingViewController) [ac dismissViewControllerAnimated:YES completion:nil];
+    });
 }
 
 #pragma mark 搜索

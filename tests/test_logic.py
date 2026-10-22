@@ -90,8 +90,14 @@ check(len(bundles) >= 25, "系统应用名单条数 >= 25", "（实际 %d）" % 
 print("\n== 2. 杀进程守卫 ==")
 check("if (pid <= 1) return NO;" in proc, "拒绝 pid<=1（内核/launchd）")
 check("if (pid == getpid()) return NO;" in proc, "拒绝杀自己")
-check("if (errno == EPERM) return kill(pid, SIGTERM) == 0;" in proc, "无权限时降级 SIGTERM 而非强杀")
+check("kill(pid, SIGTERM) == 0" in proc, "无权限时降级 SIGTERM 而非强杀")
 check("[RBProtectedBundleIDs() containsObject:bundleID]" in strip_comments(proc), "killApp: 再拦一次系统 App")
+clean_proc = strip_comments(proc)
+check("RBIsSystemBundle" in clean_proc and 'hasPrefix:@"com.apple."' in clean_proc,
+      "系统 App 按 com.apple. 前缀整片拦（不依赖清单是否写全）")
+check("RBKillViaRunningBoard" in clean_proc and "terminateWithExplanation:" in clean_proc,
+      "kill 失败时走 RunningBoard 正规终止")
+check("[now isEqualToString:bundleID]" in clean_proc, "杀之前校验 pid 仍属于同一 bundle（防 pid 复用误杀）")
 
 print("\n== 3. 一键加速过滤规则（用真实名单 + 真实阈值做判定） ==")
 boost = read("RBBooster.m")
@@ -100,6 +106,7 @@ thresh = int(m.group(1)) if m else None
 check(thresh == 8, "跳过占用 < 8MB 的进程", "（源码阈值 %s）" % thresh)
 check('if ([protect containsObject:bid]) continue;' in boost, "真后台白名单不杀")
 check('if ([protectedBundles containsObject:bid]) continue;' in boost, "系统应用不杀")
+check('if ([RBProcesses isSystemBundle:bid]) continue;' in boost, "com.apple.* 在候选阶段就被排除")
 check('if (pid <= 0 || pid == me) continue;' in boost, "跳过非法 pid 与自身")
 check("usleep(600 * 1000)" in boost, "杀完等待 600ms 再读内存（避免读到旧值）")
 check("ri_phys_footprint" in boost, "单进程占用用 phys_footprint（真实值）")
@@ -118,7 +125,9 @@ procs = [
 protect = {"com.example.backstage"}
 kept = []
 for bid, mb in procs:
-    if bid in bundles:            # 系统应用 / 自己
+    if bid.startswith("com.apple."):   # 系统应用（前缀整片拦）
+        continue
+    if bid in bundles:                 # 自己
         continue
     if bid in protect:            # 真后台白名单
         continue
@@ -127,6 +136,28 @@ for bid, mb in procs:
     kept.append(bid)
 expect = ["com.tencent.xinWeChat", "com.netease.cloudmusic"]
 check(kept == expect, "候选集正确（只留真该杀的）", "→ %s" % kept)
+
+print("\n== 3.5 本轮修掉的问题（每条都是源码里可验证的守卫） ==")
+root_src = {f: strip_comments(read(f)) for f in sorted(os.listdir(SRC)) if f.endswith((".m", ".h"))}
+bt = root_src["RBBackstage.m"]
+check("class_addMethod" in bt, "窗口层级 hook 用 class_addMethod，不波及父类 UIWindow")
+check("method_exchangeImplementations" not in bt, "不再用 method_exchangeImplementations（会改到继承来的方法）")
+check("destroyScene" in bt and bt.count("destroyScene") >= 2, "binder 不可用时回收已创建的 scene（不泄漏）")
+check("dropIfStale" in bt and "RBIsAlive" in bt, "目标进程退出后清掉陈旧 scene，不假装已开启")
+
+st = root_src["RBStore.m"]
+check("RBSanitizeSet" in st and "isKindOfClass:[NSArray class]" in st, "配置项做类型校验（坏 plist 不会崩在启动）")
+
+vc = root_src["RBRootVC.m"]
+check("infoAtIndex:" in vc and "self.shown.count" in vc, "表格取值加越界保护")
+check("idleTimerDisabled" not in "".join(root_src.values()), "去掉了全局常亮（原写法退出也不恢复）")
+check("presentAlert:" in vc, "所有弹窗统一走 presentAlert:（避免 already presenting）")
+_t1 = vc.index("- (void)tapBoost {")
+_t2 = vc.index("- (void)doBoostWithCandidates:(NSArray *)cands {")
+check("dispatch_get_global_queue" in vc[_t1:_t2], "一键加速的进程枚举放在后台线程（不卡主线程）")
+
+check("RBHostPort" in root_src["RBProcesses.m"], "host 端口缓存复用（频繁 mach_host_self 会泄漏 send right）")
+check("bundleIDForPid" in root_src["RBProcesses.m"], "进程枚举复用同一套 pid -> bundleID 解析")
 
 print("\n== 4. 源码级后门回归（原包有、本包必须没有） ==")
 all_src = "\n".join(strip_comments(read(f)) for f in sorted(os.listdir(SRC)) if f.endswith((".m", ".h")))

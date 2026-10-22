@@ -27,34 +27,49 @@
     self.window.rootViewController = nav;
     [self.window makeKeyAndVisible];
 
-    [UIApplication sharedApplication].idleTimerDisabled = YES;
+    // 注意：这里不再设置 idleTimerDisabled = YES。
+    // 原先把屏幕常亮写死在启动里，退出 App 后也不会恢复，纯粹耗电。
 
     dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(0.8 * NSEC_PER_SEC)),
                    dispatch_get_global_queue(QOS_CLASS_UTILITY, 0), ^{
         [self restoreAutoStart];
-        if ([RBStore shared].boostOnLaunch) {
-            RBLog(@"启动加速");
-            [RBBooster boostProtecting:[RBStore shared].backstageIDs];
+
+        if ([[RBStore shared] boostOnLaunch]) {
+            dispatch_async(dispatch_get_main_queue(), ^{
+                RBLog(@"启动加速");
+                [RBBooster boostProtecting:[RBStore shared].backstageIDs];
+            });
         }
     });
     return YES;
 }
 
-/// 把「自启」列表里正在运行的 App 重新拉进真后台
+/// 把「自启」列表里正在运行的 App 重新拉进真后台。
+/// 进程枚举放后台线程（读几十个 Info.plist），真正建 scene 回主线程（UIKit 相关）。
 - (void)restoreAutoStart {
     NSSet *autoStart = [[RBStore shared].autoStartIDs copy];
     if (autoStart.count == 0) return;
+
     NSDictionary *running = [RBProcesses runningPids];
+    NSMutableArray *hits = [NSMutableArray array];
     for (NSString *bid in autoStart) {
         NSNumber *pid = running[bid];
-        if (!pid) continue;
-        NSError *err = nil;
-        if ([[RBBackstage shared] enableForBundle:bid pid:pid.intValue error:&err]) {
-            RBLog(@"自启真后台已恢复：%@", bid);
-        } else {
-            RBLog(@"自启恢复失败：%@ (%@)", bid, err.localizedDescription);
-        }
+        if (pid) [hits addObject:@[bid, pid]];
     }
+    if (hits.count == 0) return;
+
+    dispatch_async(dispatch_get_main_queue(), ^{
+        for (NSArray *pair in hits) {
+            NSString *bid = pair[0];
+            pid_t pid = (pid_t)[pair[1] intValue];
+            NSError *err = nil;
+            if ([[RBBackstage shared] enableForBundle:bid pid:pid error:&err]) {
+                RBLog(@"自启真后台已恢复：%@", bid);
+            } else {
+                RBLog(@"自启恢复失败：%@ (%@)", bid, err.localizedDescription);
+            }
+        }
+    });
 }
 
 - (void)applicationDidEnterBackground:(UIApplication *)application {
