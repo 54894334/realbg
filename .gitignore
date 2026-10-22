@@ -1,0 +1,5 @@
+.theos/
+packages/
+Payload/
+*.tipa
+*.ipa

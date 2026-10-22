@@ -1,0 +1,76 @@
+name: build-realbg
+
+on:
+  push:
+    branches: [ main, master ]
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+jobs:
+  build:
+    runs-on: macos-14
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: 安装 Theos + iOS SDK
+        run: |
+          brew install ldid xz || true
+          export THEOS=$HOME/theos
+          git clone --depth 1 --recursive https://github.com/theos/theos.git "$THEOS"
+          mkdir -p "$THEOS/sdks"
+          curl -fsSL -o /tmp/sdks.tar.gz https://github.com/theos/sdks/archive/refs/heads/master.tar.gz
+          tar -xzf /tmp/sdks.tar.gz -C /tmp
+          cp -R /tmp/sdks-master/*.sdk "$THEOS/sdks/" || true
+          echo "THEOS=$THEOS" >> "$GITHUB_ENV"
+
+      - name: 编译
+        run: |
+          make clean || true
+          make FINALPACKAGE=1
+
+      - name: 组装 .app 并打 tipa
+        run: |
+          APP=""
+          for c in ".theos/_/Applications/RealBG.app" ".theos/obj/RealBG.app" ".theos/obj/debug/RealBG.app"; do
+            if [ -d "$c" ]; then APP="$c"; break; fi
+          done
+          if [ -z "$APP" ]; then APP=$(find .theos -type d -name "RealBG.app" | sort | head -n 1); fi
+          if [ -z "$APP" ] || [ ! -f "$APP/RealBG" ]; then
+            echo "没找到 .app"; find .theos -maxdepth 4 -name "*.app" -print; exit 1
+          fi
+          echo "APP=$APP"
+          file "$APP/RealBG"; lipo -info "$APP/RealBG" || true
+
+          cp RealBG/Info.plist "$APP/Info.plist"
+          plutil -lint "$APP/Info.plist"
+          cp RealBG/*.png "$APP"/ 2>/dev/null || true
+
+          ldid -Sentitlements.plist "$APP/RealBG"
+          echo "=== entitlements ==="
+          ldid -e "$APP/RealBG" || true
+
+          rm -rf Payload && mkdir -p Payload
+          cp -R "$APP" Payload/
+          zip -qry RealBG.tipa Payload
+          cp RealBG.tipa RealBG.ipa
+          unzip -l RealBG.tipa
+          unzip -l RealBG.tipa | grep -q "Payload/RealBG.app/Info.plist" || { echo "缺 Info.plist"; exit 1; }
+          ls -la RealBG.tipa
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: RealBG-tipa
+          path: |
+            RealBG.tipa
+            RealBG.ipa
+
+      - name: 回推产物到 dist 分支
+        run: |
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git checkout -B dist
+          git add -f RealBG.tipa RealBG.ipa
+          git commit -m "build: RealBG ${GITHUB_SHA::7}" || echo "no change"
+          git push -f origin dist

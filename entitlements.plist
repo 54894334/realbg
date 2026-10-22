@@ -1,0 +1,47 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+    <!-- TrollStore 安装时保留这些权限 -->
+    <key>platform-application</key>
+    <true/>
+
+    <!-- 读写 /var/mobile/Library/Preferences 存配置、枚举别的 App -->
+    <key>com.apple.private.security.no-sandbox</key>
+    <true/>
+    <key>com.apple.private.security.storage.AppBundles</key>
+    <true/>
+    <key>com.apple.private.security.storage.AppDataContainers</key>
+    <true/>
+
+    <!-- 真后台：把目标 App 的 scene 挂到本进程，需要 springboard-ui client -->
+    <key>com.apple.springboard-ui.client</key>
+    <true/>
+
+    <!-- 杀后台 / 查进程状态 -->
+    <key>com.apple.runningboard.terminateprocess</key>
+    <true/>
+    <key>com.apple.runningboard.process-state</key>
+    <true/>
+    <key>com.apple.runningboard.targetidentities</key>
+    <true/>
+    <key>com.apple.runningboard.assertions.frontboard</key>
+    <true/>
+
+    <!-- 拉起 App（点「开启真后台」时如果它还没在跑） -->
+    <key>com.apple.runningboard.launchprocess</key>
+    <true/>
+    <key>com.apple.frontboard.launchapplications</key>
+    <true/>
+
+    <key>com.apple.security.exception.mach-lookup.global-name</key>
+    <array>
+        <string>com.apple.frontboard.systemappservices</string>
+        <string>com.apple.runningboardd</string>
+    </array>
+
+    <!-- 注意：这里没有 task_for_pid-allow / system-task-ports / hid.* / jetsam / persona-mgmt。
+         原包带了一整套，其中 task_for_pid 等于可以读写任意 App 的内存，
+         对「开关真后台 + 杀进程」没有任何必要，全部去掉。 -->
+</dict>
+</plist>
