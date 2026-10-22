@@ -294,7 +294,7 @@ static NSSet *RBProtectedExecNames(void) {
                           [bundlePath stringByAppendingPathComponent:@"Info.plist"]];
     NSString *bid = [info isKindOfClass:[NSDictionary class]] ? info[@"CFBundleIdentifier"] : nil;
     if (![bid isKindOfClass:[NSString class]] || bid.length == 0) {
-        bid = parts[1].stringByDeletingPathExtension;
+        bid = [(NSString *)parts[1] stringByDeletingPathExtension];
     }
     return bid.length ? bid : nil;
 }

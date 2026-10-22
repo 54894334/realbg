@@ -149,7 +149,50 @@ mach-lookup: frontboard.systemappservices / runningboardd  连这两个服务
 
 ---
 
-## 四、白苹果风险评估
+## 四、第二版复查：15 个 bug + 安全复核
+
+第二版把整个工程当陌生代码重读了一遍，逐条对着源码找问题。下面每一条都能在源码里指出位置，
+并且都已在 `tests/test_logic.py` 里加了对应断言（第 3.5 节），防止以后改回去。
+
+| # | 问题 | 后果 | 修法 |
+|---|---|---|---|
+| 1 | 表格 `self.shown[indexPath.row]` 没有边界判断 | 刷新瞬间数据变短 → `NSRangeException` **闪退** | 统一走 `infoAtIndex:`，越界返回 nil |
+| 2 | 「一键加速」在主线程枚举全系统进程 + 逐个读 Info.plist | 点一下卡住 0.5–2 秒，像死机 | 移到后台队列，按钮先变「正在统计…」 |
+| 3 | 内存标签每次刷新都重算「可清理」，和列表刷新重复扫两遍进程 | 电量/流畅度白给 | 合并进 `reload` 一次算完，存成属性 |
+| 4 | 弹窗还在显示时又 present 新弹窗 | 控制台 `already presenting`，提示**直接不显示** | 统一 `presentAlert:`：先关旧的再弹 |
+| 5 | `mach_host_self()` 每次都拿一个 send right，从不释放 | 长时间挂着跑会累积端口权 | `RBHostPort()` 缓存一个端口反复用 |
+| 6 | `proc_pid_rusage` 失败返回 0，又被 `< 8MB 跳过` 规则筛掉 | **所有候选消失，按钮永远「没有可清理」** | 取不到就按 24MB 估，UI 上标 `~` |
+| 7 | `windowLevel` 用 `method_exchangeImplementations` 换 IMP | 若该方法继承自 `UIWindow`，等于把**全进程所有窗口**层级改成 1e7（弹窗/键盘一起乱） | 改 `class_addMethod`，只作用在 `UIRootSceneWindow` |
+| 8 | binder 不可用时，已 `createScene` 的 scene 不回收 | scene 泄漏，目标 App 状态错乱 | 走 `destroyScene:withTransitionContext:` |
+| 9 | 目标 App 被杀后旧 scene 记录不失效 | `isEnabled` 永远 YES，开关显示「已开启」其实早没了 | `dropIfStale:` + `kill(pid,0)` 探活 |
+| 10 | 配置 plist 被写坏或被别的进程改成非数组 | `setWithArray:` 抛异常，**启动即崩** | `RBSanitizeSet()` 只收非空字符串 |
+| 11 | 启动里写死 `idleTimerDisabled = YES` | 屏幕永不熄灭，退出 App 也不恢复，纯耗电 | 删掉 |
+| 12 | 枚举到执行之间进程退出、pid 被复用 | 可能**杀错进程** | `killApp:` 前重新解析该 pid 的 bundleID 比对 |
+| 13 | `kill()` 跨 uid 会 EPERM（App 杀不到别的 uid 进程） | 加速可能一个都杀不掉，白点 | 失败自动走 RunningBoard `terminateWithExplanation:` |
+| 14 | 系统 App 只靠 28 条清单拦 | 清单随 iOS 版本会漏，漏一个就可能杀到系统 App | 加 `com.apple.*` 前缀整片拦，清单降级成第二道保险 |
+| 15 | 日志里 `paths.count - scan.count` 用的是合并后的值 | 打出来的数字是负的/乱的 | 先存 `lsCount` 再合并 |
+
+### 安全复核（第二版新增的能力）
+
+第 13 条引入的 `RunningBoard terminateWithExplanation:` 是**系统正规 API**（不是私有注入），
+用的就是 `com.apple.runningboard.terminateprocess` 这条本来就在清单里的权限。它带来一个新风险面：
+终止能力比 `kill()` 更强。因此配套加了两道限制：
+
+1. `com.apple.*` 在**候选阶段**就被排除（`isSystemBundle:`），根本进不了终止队列；
+2. `killApp:` 里再拦一次系统清单 + 自查 bundleID，`pid<=1`、`pid==getpid()` 一律拒绝。
+
+entitlements 仍是 12 条，一条没加。仍然没有：网络、IPC、`dlopen`、`MSHookFunction`、
+`task_for_pid`、`system-task-ports`、`hid.*`、`jetsam`、`persona-mgmt`。
+
+### 剩下的风险（只能真机确认，脚本管不了）
+
+| 项 | 说明 |
+|---|---|
+| `proc_pid_rusage` 跨 uid | 拿不到就显示 `~24 MB`，数字是估值不是实测；能拿到时是真值 |
+| scene 挂载 | iOS 16/17/18 的 FrontBoard 类名/方法名有差异，失败会自动退回 RBS assertion（保活但可能重载 UI） |
+| 加速效果 | 只动第三方 App；系统 App、真后台白名单、8MB 以下的一律不动，所以「释放量」不会很夸张 |
+
+## 五、白苹果风险评估
 
 结论：**不会白苹果**。逐条说明为什么：
 
@@ -163,7 +206,7 @@ mach-lookup: frontboard.systemappservices / runningboardd  连这两个服务
 
 ---
 
-## 五、测试与验证（都是真实跑过的，不是"应该没问题"）
+## 六、测试与验证（都是真实跑过的，不是"应该没问题"）
 
 ### 1. 产物硬校验 `tests/verify_tipa.py`（读真实字节）
 
@@ -171,7 +214,7 @@ mach-lookup: frontboard.systemappservices / runningboardd  连这两个服务
 
 ```
 V1 包结构            Info.plist 1620 B / RealBG 308560 B / 图标 3 个
-V2 Info.plist        cn.bswbw.RealBG · 真后台 Pro · 1.0.0(1) · iOS15.0 · 1,2
+V2 Info.plist        cn.bswbw.RealBG · 真后台 Pro · 1.0.1(2) · iOS15.0 · 1,2
 V3 Mach-O            FAT 2 切片：arm64 MH_EXECUTE 146048 B
                                   arm64e MH_EXECUTE 144720 B
 V4 签名 entitlements  两个切片各解出 12 条（解 LC_CODE_SIGNATURE -> SuperBlob type5）
@@ -181,7 +224,7 @@ V6 后门标记          com.example.myPort / CFMessagePort* / com.shadow.getEsp
 
 `V4` 不是"搜字符串有没有"，是真的把代码签名里的 SuperBlob 解开、把 entitlements 反序列化出来看的，12 条逐条列在脚本输出里。
 
-### 2. 源码逻辑测试 `tests/test_logic.py`（61 项，全通过）
+### 2. 源码逻辑测试 `tests/test_logic.py`（76 项，全通过）
 
 不是复述代码，而是**从真实源文件里解析出白名单/阈值/守卫**，再用这些真实数据跑判定：
 
@@ -215,7 +258,7 @@ CI 里两步都挂了：先跑 `test_logic.py`，出包后再跑 `verify_tipa.py
 第 1 项过不了（闪退）→ 多半是 iOS 版本与 `UIRootWindowScenePresentationBinder` 的类名差异，把 `设置 → 隐私 → 分析与改进 → 分析数据` 里的 `RealBG` 崩溃日志给我，能直接定位。
 第 3 项过不了 → 那台系统的 FBScene 路径变了，会看到日志「scene 方案异常」，会自动退回 RBS assertion 兜底（保活但 UI 状态可能重载）。
 
-## 六、目录结构
+## 七、目录结构
 
 ```
 Makefile                  Theos application 工程
@@ -235,7 +278,7 @@ tests/verify_tipa.py      产物硬校验（结构/Mach-O/签名 entitlements/�
 .github/workflows/build.yml  Theos 编译 → 组 .app → ldid 签 → 打 tipa → 硬校验 → 推 dist 分支
 ```
 
-## 七、构建
+## 八、构建
 
 CI 在 macOS runner 上跑 Theos，产物推到 `dist` 分支：
 
@@ -256,7 +299,7 @@ ldid -Sentitlements.plist "$APP/RealBG"
 mkdir -p Payload && cp -R "$APP" Payload/ && zip -qry RealBG.tipa Payload
 ```
 
-## 八、用法
+## 九、用法
 
 1. TrollStore 装 `RealBG.tipa`
 2. 打开要保活的 App，回本 App 里左滑 → **开启真后台**（或点右上「全部真后台」一键给所有运行中的 App 挂上）
