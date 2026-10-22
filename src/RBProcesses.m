@@ -18,6 +18,7 @@
 #import <mach/mach_host.h>
 #import <mach/host_info.h>
 #import <mach/vm_statistics.h>
+#import <objc/message.h>
 
 // 系统自带的、杀了会影响使用的进程/应用
 static NSSet *RBProtectedBundleIDs(void) {
