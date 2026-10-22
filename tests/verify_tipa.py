@@ -228,7 +228,10 @@ def main():
         bad("不是合法 zip: %s" % e); return 2
     names = z.namelist()
     for n in (base + "Info.plist", exe_path):
-        (ok if n in names else bad)("%s (%d B)" % (n, z.getinfo(n).file_size if n in names else 0))
+        if n in names:
+            ok("%s (%d B)" % (n, z.getinfo(n).file_size))
+        else:
+            bad("缺 %s" % n)
     icons = sorted(n for n in names if n.startswith(base + "AppIcon") and n.endswith(".png"))
     (ok if len(icons) >= 1 else warn)("图标 %d 个" % len(icons))
     junk = [n for n in names if n.startswith("__MACOSX") or "/._" in n]
@@ -282,11 +285,11 @@ def main():
         (ok if "main" in info else bad)("  %-7s LC_MAIN %s" % (name, "存在" if "main" in info else "缺失（没有入口点，启动即退）"))
         ok("  %-7s platform=%s minos=%s sdk=%s %s" % (
             name, info.get("platform"), info.get("minos"), info.get("sdk"),
-            "chained_fixups" if info.get("chained_fixups") else "classic")))
+            "chained_fixups" if info.get("chained_fixups") else "classic"))
 
         sig = info.get("sig")
         if sig:
-            e, err = entitlements_of(bin_data if len(slices) == 1 else sb[sig[0]:sig[0] + sig[1]])
+            e, err = entitlements_of(sb[sig[0]:sig[0] + sig[1]])
             if e:
                 ok("  %-7s 签名解出 %d 条 entitlements" % (name, len(e)))
                 if all_ents is None:
