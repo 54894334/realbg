@@ -2,8 +2,8 @@
 
 基于对 **巨魔真后台 1.5**（`cn.bswbw.RealBackstage`，`RealBackstage_1.5.tipa`，358,657 字节）的静态逆向，**重写**的同功能 App —— 不是改包，源码级重建，所以后门、冗余权限、写死的路径一个都不继承。
 
-- 包名：`cn.bswbw.RealBG`　显示名：真后台 Pro　版本：1.0.0
-- 目标系统：iOS 15.0+（arm64 / arm64e）
+- 包名：`cn.bswbw.RealBG`　显示名：真后台 Pro　版本：1.3.0
+- 目标系统：iOS 14.0+（arm64 单切片）
 - 安装方式：TrollStore 直接装 `.tipa`，**不需要越狱**
 
 ---
@@ -193,7 +193,158 @@ entitlements 仍是 12 条，一条没加。仍然没有：网络、IPC、`dlope
 | scene 挂载 | iOS 16/17/18 的 FrontBoard 类名/方法名有差异，失败会自动退回 RBS assertion（保活但可能重载 UI） |
 | 加速效果 | 只动第三方 App；系统 App、真后台白名单、8MB 以下的一律不动，所以「释放量」不会很夸张 |
 
-## 五、1.2.0：1.1.0 仍然秒退的真正原因
+## 五、1.3.0：为什么「加速完了它还在」
+
+### 现场三条
+
+1. 点一键加速，提示结束了 N 个，回到列表 —— 那几个 App 还挂着「运行中」，还在转圈
+2. 再点一次，提示「无需加速」
+3. 内存数字几乎没动
+
+这三条其实是**一个**链式故障，不是三个 bug。
+
+### 根因一：`kill()` 返回 0，不等于进程死了
+
+1.2.x 的写法：
+
+```objc
+if (kill(pid, SIGKILL) == 0) return YES;      // ← 错
+```
+
+`kill()` 的返回值只说明**信号没被内核拒收**，不代表目标进程已经退出。跨 uid 的进程
+被沙盒或 RunningBoard 拦下时，调用照样返回 0，进程完好无损。于是界面报「结束 5 个」，
+实际上一个都没死 —— 这就是现象 1 的前半段。
+
+1.3.0 改成**回读进程表**：
+
+```objc
++ (BOOL)isPidAlive:(pid_t)pid {
+    if (kill(pid, 0) != 0 && errno != EPERM) return NO;
+    char path[PROC_PIDPATHINFO_MAXSIZE];
+    return proc_pidpath(pid, path, sizeof(path)) > 0;   // 僵尸进程取不到路径
+}
+
++ (BOOL)killPid:(pid_t)pid {
+    if (![self isPidAlive:pid]) return YES;
+    kill(pid, SIGKILL);
+    if ([self waitPidDead:pid timeoutMS:240]) return YES;
+    kill(pid, SIGTERM);
+    if ([self waitPidDead:pid timeoutMS:200]) return YES;
+    (void)RBKillViaRunningBoard(pid);
+    if ([self waitPidDead:pid timeoutMS:400]) return YES;
+    return ![self isPidAlive:pid];        // 以进程表为准
+}
+```
+
+`isPidAlive` 里那一步 `proc_pidpath` 不是多余的：僵尸进程已经死了、只是还没被父进程
+回收，`kill(pid, 0)` 对它同样返回 0。不加这一层，会把僵尸当成「杀不掉」，永远卡在失败里。
+
+### 根因二：杀了之后 SpringBoard 会立刻把它拉起来
+
+这是真后台 App 的正常行为 —— FrontBoard 认为它还有后台 scene，于是重新 `launch` 一个
+新进程恢复到后台。所以「杀一次」天然不够，一轮清场之后列表里看到的仍然是活的。
+
+1.3.0 做三件事：
+
+- 加速前先 `[RBBackstage releaseOwnedBackstage]`，把自己挂上去的 scene/assertion 全撤掉 ——
+  一边杀一边托着等于白干
+- 信号杀不掉时补一条 `FBSSystemService terminateApplication:forReason:andReport:withDescription:`，
+  这是 SpringBoard 自己关 App 走的路径，它会顺手把 scene 从 FrontBoard 摘掉
+- **最多清三轮**：杀掉 → 等 420ms → 重新扫一遍 → 把「刚才杀过、现在又活了」的再杀一次
+
+```objc
+for (int round = 0; round < RBMaxRounds; round++) {
+    NSArray *cands = (round == 0) ? [self candidatesProtecting:p]
+                                  : [self revivedFrom:tried protect:p];
+    ...
+}
+```
+
+### 根因三：复活后的进程太小，被 8MB 门槛漏掉了
+
+第一轮候选有 `mb < 8` 的过滤（太小不值得动）。但 App 刚被拉起时 footprint 常常只有
+2–6MB —— 它明明在跑，却因为「太小」进不了候选。这就产生了现象 2：
+**列表显示还在运行，点加速却说无需加速**。
+
+所以复扫路径 `revivedFrom:protect:` **不设内存门槛**。它只关心一件事：这些 bundleID
+是不是刚才被我杀过、现在又出现在进程表里。
+
+### 终局校验：成功以最后一次扫描为准
+
+三轮跑完再扫一遍进程表，凡是还活着的，从「已结束」里剔掉、记进失败：
+
+```objc
+NSDictionary *finalRunning = [RBProcesses runningPids];
+for (NSString *bid in [killedIDs array]) {
+    if (finalRunning[bid]) {
+        [killedIDs removeObject:bid];
+        [failed addObject:bid];
+        [relaunched addObject:bid];
+    }
+}
+```
+
+所以现在弹窗里的数字是**实测**的，不再是「信号发出去了就算成功」。
+结果里也分开报：结束 N 个 / 其中 M 个被系统重新拉起 / 失败 K 个。
+
+### 界面：加速完立刻变，不等重新枚举
+
+一次完整枚举要扫全部安装包并解图标，几秒钟。1.2.x 在加速完成后才发起 reload，
+用户在这几秒里看到的还是旧状态 —— 再叠加一次慢枚举把加速前的进程表写回来，
+就成了「怎么刷都是运行中」。
+
+两处改动：
+
+```objc
+// ① 就地更新：拿 boost 返回的 killedIDs 直接改内存里的对象
+- (void)applyKilledIDs:(NSArray *)ids {
+    ...
+    self.appliedSeq = ++self.reloadSeq;    // 让所有在飞的 reload 作废
+    [self applyFilter];
+}
+
+// ② reload 结果按序号判过期
+if (seq < self.appliedSeq) { ...丢弃... }
+```
+
+另外把「运行中」的转圈换成了圆点：绿＝在跑、灰＝没在跑。转圈没有「已结束」这个语义，
+一直转本身就会让人以为没杀成。
+
+### 界面其他改动
+
+| 位置 | 改动 |
+|---|---|
+| 顶部 | 新增内存卡片：已用 / 可用 / 可清理三栏 + 已用占比进度条；下方一行小字带锁定数量 |
+| 列表 | 图标 46pt 圆角 12 + 细描边；运行状态用圆点；行高 72 |
+| 底部 | 按钮改渐变 + 外发光 + 按下缩放；下面一行固定说明「只结束没锁定的后台 App」 |
+| 图标 | 换成仪表环方案：绿色进度环（12 点起 288°）+ 玻璃内圆 + 白闪电，60/120/180 三档都是 720 画布降采样，没有锯齿 |
+
+### 自启 和 保活（真后台）到底差在哪
+
+这是两个完全不同方向的东西，名字容易混，效果也完全相反：
+
+| | **保活（真后台）** | **自启** |
+|---|---|---|
+| 解决的问题 | App 切到后台**别被系统挂起 / 别被回收** | App 被结束之后**自动再开回来** |
+| 生效时机 | App 正在运行时 | 本 App（真后台 Pro）启动时 |
+| 实现手段 | 给它挂 FrontBoard scene / RunningBoard 断言，让系统认为它还在前台渲染 | 记一份 bundleID 名单，下次启动按名单重新拉起 |
+| 依赖前提 | 目标 App 必须**已经在运行** | 目标 App 不必在运行 |
+| 代价 | 它一直占着内存，一键加速会绕开它 | 只是「重新打开」，不占常驻内存 |
+| 关闭方式 | 左滑「关闭真后台」 | 右滑「取消自启」 |
+
+一句话：**保活是「别让它睡」，自启是「睡了再叫醒」。**
+
+- 想让微信一直收消息 → 开**保活**（它会一直占内存，所以加速不会碰它）
+- 想让某个 App 每次打开本工具时自动回到后台 → 开**自启**
+- 两个都开也可以：先自启拉起，再挂保活托住
+
+**锁定**是第三件事：它既不是保活也不是自启，只是一个「别动它」的标记 ——
+一键加速、退出清理都会跳过锁定项，而且**锁定优先级最高**（锁定 > 保活 > 退出即杀）。
+锁定一个 App 时会自动把它从「退出即杀」里移除，避免两套语义打架。
+
+---
+
+## 六、1.2.0：1.1.0 仍然秒退的真正原因
 
 1.1.0 装上去还是点开就退，而且「文件」App 里找不到本 App 的目录。这两条线索合起来指向一件事：
 **进程很可能根本没跑到 `main`**。围绕这个假设重新排查，找到三个真问题，其中一个是我自己在上一版里制造的。
@@ -376,7 +527,7 @@ com.apple.private.security.no-container  （原包也没有）
 | 7 | 产物校验新增 V7：逐个核对 `LC_LOAD_DYLIB` | 出现 `PrivateFrameworks` 直接判失败 |
 | 8 | 产物校验新增 `cryptid` / `LC_MAIN` 检查 | 非 0 cryptid、缺入口点都判失败 |
 
-## 六、1.1.0：闪退定位 + 保留名单
+## 七、1.1.0：闪退定位 + 保留名单
 
 ### 1. 闪退：找到两处真实的崩溃点
 
@@ -442,7 +593,7 @@ exe substringToIndex: r.location + r2.location + r2.length     // 少加了 r.le
 
 `r` 是 `/Bundle/Application/` 这个标记的 range。少加它的长度，截出来的路径整体左移 19 个字符，永远读不到 `Info.plist`，只能退化成用 `.app` 目录名当 bundleID。结果就是**进程枚举到的 bundleID 跟配置里存的对不上，「运行中」这个状态一直是错的**。现在改用字符串拼接，不再做索引算术。
 
-## 七、白苹果风险评估
+## 八、白苹果风险评估
 
 结论：**不会白苹果**。逐条说明为什么：
 
@@ -456,7 +607,7 @@ exe substringToIndex: r.location + r2.location + r2.length     // 少加了 r.le
 
 ---
 
-## 八、测试与验证（都是真实跑过的，不是"应该没问题"）
+## 九、测试与验证（都是真实跑过的，不是"应该没问题"）
 
 ### 1. 产物硬校验 `tests/verify_tipa.py`（读真实字节）
 
@@ -474,7 +625,7 @@ V6 后门标记          com.example.myPort / CFMessagePort* / com.shadow.getEsp
 
 `V4` 不是"搜字符串有没有"，是真的把代码签名里的 SuperBlob 解开、把 entitlements 反序列化出来看的，12 条逐条列在脚本输出里。
 
-### 2. 源码逻辑测试 `tests/test_logic.py`（149 项，全通过）
+### 2. 源码逻辑测试 `tests/test_logic.py`（176 项，全通过）
 
 不是复述代码，而是**从真实源文件里解析出白名单/阈值/守卫**，再用这些真实数据跑判定：
 
@@ -508,7 +659,7 @@ CI 里两步都挂了：先跑 `test_logic.py`，出包后再跑 `verify_tipa.py
 第 1 项过不了（闪退）→ 多半是 iOS 版本与 `UIRootWindowScenePresentationBinder` 的类名差异，把 `设置 → 隐私 → 分析与改进 → 分析数据` 里的 `RealBG` 崩溃日志给我，能直接定位。
 第 3 项过不了 → 那台系统的 FBScene 路径变了，会看到日志「scene 方案异常」，会自动退回 RBS assertion 兜底（保活但 UI 状态可能重载）。
 
-## 九、目录结构
+## 十、目录结构
 
 ```
 Makefile                  Theos application 工程
@@ -528,7 +679,7 @@ tests/verify_tipa.py      产物硬校验（结构/Mach-O/签名 entitlements/�
 .github/workflows/build.yml  Theos 编译 → 组 .app → ldid 签 → 打 tipa → 硬校验 → 推 dist 分支
 ```
 
-## 十、构建
+## 十一、构建
 
 CI 在 macOS runner 上跑 Theos，产物推到 `dist` 分支：
 
@@ -549,9 +700,18 @@ ldid -Sentitlements.plist "$APP/RealBG"
 mkdir -p Payload && cp -R "$APP" Payload/ && zip -qry RealBG.tipa Payload
 ```
 
-## 十一、用法
+## 十二、用法
 
 1. TrollStore 装 `RealBG.tipa`
 2. 打开要保活的 App，回本 App 里左滑 → **开启真后台**（或点右上「全部真后台」一键给所有运行中的 App 挂上）
-3. 想省内存：右滑 **杀后台**；或直接点底部 **一键加速** 批量清
-4. 「自启」列表里的 App，下次本 App 启动时会自动重新挂真后台
+3. 不想让它被加速清掉：右滑 → **锁定保留**（锁定的优先级最高，加速和退出清理都会跳过它）
+4. 想省内存：右滑 **杀后台**；或直接点底部 **一键加速** 批量清
+5. 「自启」列表里的 App，下次本 App 启动时会自动重新挂真后台
+
+加速弹窗里的数字都是实测的：
+
+- **结束 N 个** —— 杀完之后回读进程表确认已经不在的数量
+- **其中 M 个被系统重新拉起，已清 K 轮** —— SpringBoard 把它拉回来过，又清掉了
+- **失败 J 个** —— 系统拒绝或进程被托管，已经跳过，不会谎报成功
+
+如果提示「不需要加速」，会说明具体原因（当前没第三方 App 在跑 / 在跑但都不到 8MB）。

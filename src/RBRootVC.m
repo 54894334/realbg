@@ -870,6 +870,15 @@ static UIColor *RBLock(void)   { return [UIColor colorWithRed:1.00 green:0.78 bl
     dispatch_async(dispatch_get_global_queue(QOS_CLASS_USER_INITIATED, 0), ^{
         NSArray *cands = [RBBooster candidatesProtecting:protect];
         NSArray *locked = [RBBooster lockedCandidatesProtecting:protect];
+
+        // 「为什么没有候选」要说清楚。用实时的进程表算，别用界面上的旧快照 ——
+        // 安全模式下 allApps 可能是空的，那样会误报「没有第三方 App 在跑」。
+        NSMutableSet *aliveSet = [NSMutableSet set];
+        for (NSString *bid in [RBProcesses runningPids]) {
+            if (![RBProcesses isSystemBundle:bid]) [aliveSet addObject:bid];
+        }
+        NSUInteger aliveOthers = aliveSet.count;
+
         dispatch_async(dispatch_get_main_queue(), ^{
             [self setBoostBusy:NO title:@"一键加速"];
 
@@ -895,10 +904,6 @@ static UIColor *RBLock(void)   { return [UIColor colorWithRed:1.00 green:0.78 bl
             if (cands.count == 0) {
                 // 说清「为什么没有」——这个 App 是否在跑、跑着为什么不算可清理，
                 // 都比干巴巴一句「无需加速」有用。
-                NSUInteger aliveOthers = 0;
-                for (RBAppInfo *i in self.allApps) {
-                    if (i.isRunning && !i.isSystem) aliveOthers++;
-                }
                 NSString *msg = nil;
                 if (lockLine.length) {
                     msg = [lockLine stringByAppendingString:
