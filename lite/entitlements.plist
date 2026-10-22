@@ -1,0 +1,15 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+    <!-- TrollStore 官方 README 给出的最小可用组合：
+         「你的应用可以用以下之一运行未沙盒化……
+           第三个（no-sandbox）是推荐的，如果你还想要一个沙盒容器」
+         探针版只要这两条，多一条都不给 —— 这样如果它还闪退，
+         就说明问题不在权限。 -->
+    <key>platform-application</key>
+    <true/>
+    <key>com.apple.private.security.no-sandbox</key>
+    <true/>
+</dict>
+</plist>

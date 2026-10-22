@@ -2,28 +2,76 @@
 <!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
 <plist version="1.0">
 <dict>
-    <!-- TrollStore 安装时保留这些权限 -->
+    <!-- ===================================================================
+         1.2.0 权限清单：以「原版 1.5 能在这台手机上正常启动」为基准重做。
+
+         上一版（1.1.0）砍到 13 条，其中加了一条原包根本没有的
+         com.apple.private.security.no-container，同时把 platform-application
+         需要的补偿权限全砍了。TrollStore 官方 README 明确写着：
+
+           「你的应用可以用以下之一运行未沙盒化：container-required /
+             no-container / no-sandbox。第三个（no-sandbox）是推荐的，
+             如果你还想要一个沙盒容器。」
+
+           「platform-application 会导致一些副作用，例如沙盒的某些部分
+             变得更严格，因此你可能需要额外的私有权限来规避。
+             （例如之后你需要为每一个想访问的 IOKit user client 类
+               单独设置例外权限）」
+
+         所以 no-container 不是必须的，加了反而没有容器；
+         而留着 platform-application 却去掉补偿权限，就会在启动阶段被拒。
+         这一版按原包的功能性权限补齐，但一条提权/后门性质的都不带。
+
+         故意不带（原包有，这里全部剔除）：
+           task_for_pid-allow                  读写任意 App 内存
+           com.apple.system-task-ports(.control) 拿系统任务端口
+           com.apple.private.hid.*（4 条）      监听/模拟硬件输入
+           com.apple.private.kernel.jetsam     内存压力仲裁
+           com.apple.private.memorystatus      改别的进程内存状态
+           com.apple.private.persona-mgmt      以 root 身份派生进程
+           proc_info-allow                     读所有进程信息
+           get-task-allow                      允许被调试
+           com.apple.security.iokit-user-client-class（24 条）全放行
+           com.apple.runningboard.hereditarygrantoriginator / primitiveattribute
+           com.apple.private.allow-background-haptics
+         =================================================================== -->
+
+    <!-- 未沙盒 + platform 身份。两条成对使用，与 TrollStore 官方推荐一致 -->
     <key>platform-application</key>
     <true/>
-
-    <!-- 读写 /var/mobile 下的配置、枚举别的 App。
-         no-container 和 no-sandbox 必须成对出现：
-         只给 no-sandbox 时，libsystem_secinit 仍会去找本 App 的容器，
-         容器不存在或权限不对就直接在启动瞬间中止进程（典型表现就是点开一闪就没了）。 -->
     <key>com.apple.private.security.no-sandbox</key>
     <true/>
-    <key>com.apple.private.security.no-container</key>
-    <true/>
+
+    <!-- 读写应用包与数据容器：枚举已装 App、读它们的 Info.plist 和图标 -->
     <key>com.apple.private.security.storage.AppBundles</key>
     <true/>
     <key>com.apple.private.security.storage.AppDataContainers</key>
     <true/>
 
-    <!-- 真后台：把目标 App 的 scene 挂到本进程，需要 springboard-ui client -->
+    <!-- platform-application 的补偿权限（渲染 / 窗口宿主）：
+         不带这些时，UIKit 初始化阶段连 backboard 与显示上下文都拿不到。
+         secure-mode 是画面上屏必需，displayable-context 是图层可显示必需。 -->
+    <key>com.apple.backboard.client</key>
+    <true/>
+    <key>com.apple.QuartzCore.displayable-context</key>
+    <true/>
+    <key>com.apple.QuartzCore.secure-mode</key>
+    <true/>
+    <!-- 真后台要把别的 App 的 scene 挂在自己的窗口上，需要窗口宿主权限 -->
+    <key>com.apple.springboard.accessibility-window-hosting</key>
+    <true/>
+    <key>com.apple.springboard.appbackgroundstyle</key>
+    <true/>
     <key>com.apple.springboard-ui.client</key>
     <true/>
 
-    <!-- 杀后台 / 查进程状态 -->
+    <!-- 拉起 App -->
+    <key>com.apple.frontboard.launchapplications</key>
+    <true/>
+    <key>com.apple.runningboard.launchprocess</key>
+    <true/>
+
+    <!-- 杀后台 / 查进程状态 / 真后台 assertion -->
     <key>com.apple.runningboard.terminateprocess</key>
     <true/>
     <key>com.apple.runningboard.process-state</key>
@@ -33,20 +81,15 @@
     <key>com.apple.runningboard.assertions.frontboard</key>
     <true/>
 
-    <!-- 拉起 App（点「开启真后台」时如果它还没在跑） -->
-    <key>com.apple.runningboard.launchprocess</key>
-    <true/>
-    <key>com.apple.frontboard.launchapplications</key>
+    <!-- 只读文件：读别的 App 的 Info.plist。写文件不在这里开 -->
+    <key>file-read-data</key>
     <true/>
 
+    <!-- 只开这两条 mach 服务，不多给 -->
     <key>com.apple.security.exception.mach-lookup.global-name</key>
     <array>
         <string>com.apple.frontboard.systemappservices</string>
         <string>com.apple.runningboardd</string>
     </array>
-
-    <!-- 注意：这里没有 task_for_pid-allow / system-task-ports / hid.* / jetsam / persona-mgmt。
-         原包带了一整套，其中 task_for_pid 等于可以读写任意 App 的内存，
-         对「开关真后台 + 杀进程」没有任何必要，全部去掉。 -->
 </dict>
 </plist>

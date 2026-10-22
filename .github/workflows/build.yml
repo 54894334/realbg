@@ -24,18 +24,29 @@ jobs:
           tar -xzf /tmp/sdks.tar.gz -C /tmp
           cp -R /tmp/sdks-master/*.sdk "$THEOS/sdks/" || true
           echo "THEOS=$THEOS" >> "$GITHUB_ENV"
+          ls "$THEOS/sdks"
 
-      - name: 源码逻辑测试（白名单/守卫/后门回归）
+      - name: 源码逻辑测试（白名单 / 守卫 / 后门回归）
         run: |
           python3 tests/test_logic.py .
 
-      - name: 编译
+      - name: 编译主工程
         run: |
+          make clean || true
+          # 链接必须成功。Makefile 已经去掉了 -Wl,-undefined,dynamic_lookup，
+          # 所以「能链上」就等于「所有符号在 iOS SDK 里都存在」——
+          # 这是防止 dyld 在 main 之前杀进程的第一道闸。
+          make FINALPACKAGE=1
+
+      - name: 编译 lite 探针版
+        run: |
+          cd lite
           make clean || true
           make FINALPACKAGE=1
 
-      - name: 组装 .app 并打 tipa
+      - name: 组装主包
         run: |
+          set -e
           APP=""
           for c in ".theos/_/Applications/RealBG.app" ".theos/obj/RealBG.app" ".theos/obj/debug/RealBG.app"; do
             if [ -d "$c" ]; then APP="$c"; break; fi
@@ -45,27 +56,62 @@ jobs:
             echo "没找到 .app"; find .theos -maxdepth 4 -name "*.app" -print; exit 1
           fi
           echo "APP=$APP"
-          file "$APP/RealBG"; lipo -info "$APP/RealBG" || true
-
           cp RealBG/Info.plist "$APP/Info.plist"
           plutil -lint "$APP/Info.plist"
           cp RealBG/*.png "$APP"/ 2>/dev/null || true
-
           ldid -Sentitlements.plist "$APP/RealBG"
-          echo "=== entitlements ==="
-          ldid -e "$APP/RealBG" || true
-
+          echo "=== 主包 entitlements ==="
+          ldid -e "$APP/RealBG"
           rm -rf Payload && mkdir -p Payload
           cp -R "$APP" Payload/
           zip -qry RealBG.tipa Payload
           cp RealBG.tipa RealBG.ipa
-          unzip -l RealBG.tipa
-          unzip -l RealBG.tipa | grep -q "Payload/RealBG.app/Info.plist" || { echo "缺 Info.plist"; exit 1; }
-          ls -la RealBG.tipa
 
-      - name: 产物硬校验（结构 / Mach-O / 签名里的 entitlements / 后门标记）
+      - name: 组装探针包
         run: |
-          python3 tests/verify_tipa.py RealBG.tipa
+          set -e
+          cd lite
+          APP=""
+          for c in ".theos/_/Applications/RealBGLite.app" ".theos/obj/RealBGLite.app" ".theos/obj/debug/RealBGLite.app"; do
+            if [ -d "$c" ]; then APP="$c"; break; fi
+          done
+          if [ -z "$APP" ]; then APP=$(find .theos -type d -name "RealBGLite.app" | sort | head -n 1); fi
+          if [ -z "$APP" ] || [ ! -f "$APP/RealBGLite" ]; then
+            echo "没找到探针 .app"; find .theos -maxdepth 4 -name "*.app" -print; exit 1
+          fi
+          echo "APP=$APP"
+          cp Info.plist "$APP/Info.plist"
+          plutil -lint "$APP/Info.plist"
+          cp ../RealBG/*.png "$APP"/ 2>/dev/null || true
+          ldid -Sentitlements.plist "$APP/RealBGLite"
+          echo "=== 探针包 entitlements ==="
+          ldid -e "$APP/RealBGLite"
+          rm -rf Payload && mkdir -p Payload
+          cp -R "$APP" Payload/
+          zip -qry ../RealBGLite.tipa Payload
+
+      - name: 二进制诊断（依赖库 / 未定义符号 / 段布局）
+        run: |
+          for f in Payload/RealBG.app/RealBG lite/Payload/RealBGLite.app/RealBGLite; do
+            [ -f "$f" ] || continue
+            echo "########## $f ##########"
+            lipo -info "$f"
+            otool -h "$f" | sed -n '2,8p'
+            echo "--- 依赖库 ---"
+            otool -L "$f"
+            echo "--- LC_BUILD_VERSION ---"
+            otool -l "$f" | grep -A5 LC_BUILD_VERSION | head -8
+            echo "--- 未定义符号（应全部由上面这些库提供）---"
+            nm -u "$f" | sort
+            echo "--- 是否残留私有框架依赖（应为空）---"
+            otool -L "$f" | grep -Ei "PrivateFrameworks|FrontBoard|RunningBoard|SpringBoard" || echo "(无)"
+            echo
+          done
+
+      - name: 产物硬校验
+        run: |
+          python3 tests/verify_tipa.py RealBG.tipa --app RealBG --bundle cn.bswbw.RealBG --version 1.2.0
+          python3 tests/verify_tipa.py RealBGLite.tipa --app RealBGLite --bundle cn.bswbw.RealBGLite --version 1.0
 
       - uses: actions/upload-artifact@v4
         with:
@@ -73,12 +119,13 @@ jobs:
           path: |
             RealBG.tipa
             RealBG.ipa
+            RealBGLite.tipa
 
       - name: 回推产物到 dist 分支
         run: |
           git config user.name "github-actions[bot]"
           git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
           git checkout -B dist
-          git add -f RealBG.tipa RealBG.ipa
+          git add -f RealBG.tipa RealBG.ipa RealBGLite.tipa
           git commit -m "build: RealBG ${GITHUB_SHA::7}" || echo "no change"
           git push -f origin dist

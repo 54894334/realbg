@@ -194,9 +194,13 @@ check("writeToFile:legacy" not in clean_store, "不写旧路径")
 
 print("\n== 6. entitlements 数量与危险项 ==")
 ents = plistlib.load(open(os.path.join(ROOT, "entitlements.plist"), "rb"))
-check(len(ents) == 13, "权限条数 = 13", "（实际 %d）" % len(ents))
-check("com.apple.private.security.no-container" in ents,
-      "no-container 与 no-sandbox 成对出现（只给 no-sandbox 会在启动瞬间被 secinit 杀掉）")
+check(len(ents) == 18, "权限条数 = 18", "（实际 %d）" % len(ents))
+check("com.apple.private.security.no-container" not in ents,
+      "不带 no-container（原包 1.5 没有这条；带上就没有沙盒容器，与 platform-application 组合更危险）")
+check("com.apple.backboard.client" in ents,
+      "带 backboard.client（platform-application 会让沙盒变严，缺它拿不到显示连接）")
+check("com.apple.QuartzCore.displayable-context" in ents and "com.apple.QuartzCore.secure-mode" in ents,
+      "带 QuartzCore 两条（图层可显示 / 可上屏）")
 DANGER = ["task_for_pid-allow", "com.apple.system-task-ports", "proc_info-allow",
           "get-task-allow", "com.apple.private.persona-mgmt",
           "com.apple.private.kernel.jetsam", "com.apple.private.memorystatus"]
@@ -292,7 +296,57 @@ check("<key>UIRequiresFullScreen</key>" not in ipl,
       "去掉 UIRequiresFullScreen（iPad 上强制四方向，只声明竖屏会断言崩溃）")
 check("UISupportedInterfaceOrientations~ipad" in ipl, "iPad 单独声明四个方向")
 check("LSSupportsOpeningDocumentsInPlace" in ipl, "文件 App 可直接打开日志目录")
-check("<string>1.1.0</string>" in ipl, "Info.plist 版本 1.1.0")
+check("<string>1.2.0</string>" in ipl, "Info.plist 版本 1.2.0")
+
+print("\n== 12. 1.2.0：消除「点开秒退」的全部已知成因 ==")
+mk_code = "\n".join(l.split("#")[0] for l in mk.split("\n"))
+check("dynamic_lookup" not in mk_code,
+      "Makefile 不再用 -Wl,-undefined,dynamic_lookup（它让符号缺失推迟到 dyld，崩在 main 之前）")
+check("ARCHS := arm64" in mk_code and "arm64e" not in mk_code,
+      "只出 arm64，不出 arm64e")
+
+bo_src = strip_comments(root_src["RBBooster.m"])
+check('dlsym(RTLD_DEFAULT, "proc_pid_rusage")' in bo_src,
+      "proc_pid_rusage 走 dlsym 取指针（符号缺失只降级，不会让 dyld 杀进程）")
+check("rusageFn(pid, RUSAGE_INFO_V4" in bo_src, "调用前判空，取不到就不调用")
+
+cr_src = strip_comments(root_src["RBCrash.m"])
+check('dlsym(RTLD_DEFAULT, "backtrace")' in cr_src, "backtrace 也走 dlsym")
+check("gBacktraceFn = (int (*)(void **, int))dlsym" in cr_src,
+      "函数指针在安装阶段（安全上下文）取好")
+check("dispatch_once" not in cr_src[cr_src.index("static void RBSignalHandler"):cr_src.index("static void RBExceptionHandler")],
+      "信号处理里不调 dispatch_once（会死锁）")
+
+check("__attribute__((constructor))" not in "".join(root_src.values()),
+      "全工程没有 constructor（不在 pre-main 阶段执行任何东西）")
+
+# lite 探针：必须真的存在，且不含任何私有 API / 私有框架
+import os as _os
+lite_main = _os.path.join(ROOT, "lite", "main.m")
+lite_mk = _os.path.join(ROOT, "lite", "Makefile")
+lite_ent = _os.path.join(ROOT, "lite", "entitlements.plist")
+check(_os.path.exists(lite_main), "存在 lite 探针源码（用来二分：打包问题 vs 代码问题）")
+if _os.path.exists(lite_main):
+    lm = strip_comments(open(lite_main, encoding="utf-8").read())
+    for bad_api in ("FBMutableSceneDefinition", "RBSDomainAttribute", "proc_listpids",
+                    "NSClassFromString", "dlsym", "task_for_pid"):
+        check(bad_api not in lm, "探针不含私有 API: %s" % bad_api)
+if _os.path.exists(lite_mk):
+    lmk = "\n".join(l.split("#")[0] for l in open(lite_mk, encoding="utf-8").read().split("\n"))
+    check("PRIVATE_FRAMEWORKS" not in lmk, "探针不链接私有框架")
+    check("dynamic_lookup" not in lmk, "探针也不用 dynamic_lookup")
+if _os.path.exists(lite_ent):
+    import plistlib as _pl
+    le = _pl.loads(open(lite_ent, "rb").read())
+    check(len(le) == 2, "探针只用 2 条权限（platform-application + no-sandbox）", "（实际 %d）" % len(le))
+
+# 产物校验器本身要能拦住「依赖私有框架」这种致命问题
+vt = open(_os.path.join(ROOT, "tests", "verify_tipa.py"), encoding="utf-8").read()
+check("ALLOWED_DYLIB_PREFIXES" in vt, "verify 会逐个核对 LC_LOAD_DYLIB")
+check("PrivateFrameworks" not in vt.split("ALLOWED_DYLIB_PREFIXES")[1].split(")")[0],
+      "verify 的白名单里不放 PrivateFrameworks")
+check("cryptid" in vt, "verify 检查 cryptid（非 0 说明还带 FairPlay 加密壳）")
+check("LC_MAIN" in vt, "verify 检查 LC_MAIN（没有入口点会启动即退）")
 
 print("\n" + "=" * 56)
 print("通过 %d 项，失败 %d 项" % (len(passed), len(failed)))

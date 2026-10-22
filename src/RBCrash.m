@@ -32,6 +32,12 @@ static char gCrashPath[PATH_MAX];
 static char gLogPath[PATH_MAX];
 static char gLogDirDoc[PATH_MAX];
 
+// backtrace 的函数指针，在安装阶段取好。
+// 用 dlsym 而不是直接调用：iOS 上 execinfo 不是官方承诺的稳定接口，
+// 直接引用 _backtrace 会让 dyld 在缺符号时于 main 之前杀进程 ——
+// 那正是「点开就闪退、日志都写不出来」的死循环。
+static int (*gBacktraceFn)(void **, int);
+
 static NSString *RBLogDirectory(void) {
     static NSString *dir;
     static dispatch_once_t once;
@@ -91,8 +97,11 @@ static void RBSignalHandler(int sig, siginfo_t *info, void *uap) {
 
     // backtrace 在信号上下文里不是严格 async-signal-safe，但栈还没被破坏时
     // 这是唯一能拿到调用栈的办法（crash reporter 普遍这么做）。
+    //
+    // 函数指针必须在安装阶段（安全上下文）取好。信号处理里不能调 dispatch_once
+    // 或 dlsym —— 前者有锁，信号恰好打断持锁线程就是死锁；后者内部也有锁。
     void *frames[64];
-    int cnt = backtrace(frames, 64);
+    int cnt = gBacktraceFn ? gBacktraceFn(frames, 64) : 0;
     for (int i = 0; i < cnt && i < 64; i++) {
         Dl_info di;
         if (dladdr(frames[i], &di) && di.dli_sname) {
@@ -141,6 +150,9 @@ void RBInstallCrashHandler(void) {
         snprintf(gLogPath, sizeof(gLogPath), "%s", [RBRunLogPath() UTF8String]);
         snprintf(gLogDirDoc, sizeof(gLogDirDoc), "%s", [RBLogDirectory() UTF8String]);
         if (gCrashPath[0] == 0) return;      // 完全取不到路径就只报警告，不影响启动
+
+        // 在安全上下文里取好 backtrace 的地址（信号处理里不能调 dlsym）
+        gBacktraceFn = (int (*)(void **, int))dlsym(RTLD_DEFAULT, "backtrace");
 
         NSSetUncaughtExceptionHandler(&RBExceptionHandler);
 

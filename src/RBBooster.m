@@ -19,6 +19,7 @@
 #import <signal.h>
 #import <string.h>
 #import <unistd.h>
+#import <dlfcn.h>
 
 // proc_pid_rusage 对不同 uid 的进程可能返回 EPERM。真拿不到就按这个值估，
 // 而不是当成 0 —— 否则 <8MB 的过滤会把所有候选都筛掉，按钮永远「没有可清理的进程」。
@@ -28,9 +29,28 @@ static const double RBFallbackFootprintMB = 24.0;
 
 + (double)footprintMBForPid:(pid_t)pid {
     if (pid <= 0) return 0;
+
+    // 这里刻意用 dlsym 取函数指针，而不是直接调用 proc_pid_rusage。
+    //
+    // 直接调用会在二进制里留下对 _proc_pid_rusage 的未定义引用。这个符号存在
+    // 版本差异，而上一版 Makefile 带了 -Wl,-undefined,dynamic_lookup ——
+    // 链接器完全不检查它是否存在，到设备上 dyld 解析失败就直接杀进程，
+    // 崩在 main 之前：图标闪一下就回桌面，App 自己一行日志都写不出来。
+    //
+    // 走 dlsym 之后：符号不存在只是「拿不到真实占用」，功能降级、不会崩。
+    static int (*rusageFn)(int, int, rusage_info_t *);
+    static dispatch_once_t once;
+    dispatch_once(&once, ^{
+        rusageFn = (int (*)(int, int, rusage_info_t *))dlsym(RTLD_DEFAULT, "proc_pid_rusage");
+        if (!rusageFn) {
+            RBLog(@"当前系统没有 proc_pid_rusage，单进程占用按估值显示");
+        }
+    });
+    if (!rusageFn) return 0;
+
     struct rusage_info_v4 ri;
     memset(&ri, 0, sizeof(ri));
-    if (proc_pid_rusage(pid, RUSAGE_INFO_V4, (rusage_info_t *)&ri) != 0) return 0;
+    if (rusageFn(pid, RUSAGE_INFO_V4, (rusage_info_t *)&ri) != 0) return 0;
     return (double)ri.ri_phys_footprint / (1024.0 * 1024.0);
 }
 

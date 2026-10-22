@@ -18,9 +18,15 @@ RealBG_CFLAGS = -fobjc-arc -I src \
 	-Wno-nullability-completeness -Wno-incompatible-pointer-types \
 	-Wno-objc-property-no-attribute -Wno-protocol -Wno-unused-but-set-variable
 RealBG_FRAMEWORKS = UIKit Foundation
-# 私有框架一律 NSClassFromString 动态取，不在链接期引用符号；
-# dynamic_lookup 兜底，避免 CI 上的 SDK 缺 PrivateFrameworks .tbd 时链接失败
-RealBG_LDFLAGS = -Wl,-undefined,dynamic_lookup
+
+# 这里原来写着 -Wl,-undefined,dynamic_lookup，是个致命错误：
+# 它让链接器不再检查任何一个符号是否存在，全部推到运行时由 dyld 解析。
+# 只要 iOS 上少一个符号，dyld 就在 main 之前直接杀进程 ——
+# 表现正是「点开就闪退、日志一个字节都没有」。
+# 现在改回正常链接：符号有问题在 CI 阶段就报错，不会流到手机上。
+# 私有框架本来就不用（全部走 NSClassFromString），不需要 dynamic_lookup。
+RealBG_LDFLAGS =
+
 RealBG_CODESIGN_FLAGS = -Sentitlements.plist
 RealBG_INSTALL_PATH = /Applications
 
