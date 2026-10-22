@@ -361,28 +361,33 @@ static NSSet *RBProtectedExecNames(void) {
 }
 
 + (NSDictionary<NSString *, NSNumber *> *)runningPids {
-    NSMutableDictionary *map = [NSMutableDictionary dictionary];
+    @try {
+        NSMutableDictionary *map = [NSMutableDictionary dictionary];
 
-    int n = proc_listpids(PROC_ALL_PIDS, 0, NULL, 0);
-    if (n <= 0) return map;
-    int cap = n / (int)sizeof(pid_t) + 64;
-    pid_t *pids = calloc((size_t)cap, sizeof(pid_t));
-    if (!pids) return map;
-    n = proc_listpids(PROC_ALL_PIDS, 0, pids, cap * (int)sizeof(pid_t));
-    if (n <= 0) { free(pids); return map; }
-    int count = n / (int)sizeof(pid_t);
-    if (count > cap) count = cap;
+        int n = proc_listpids(PROC_ALL_PIDS, 0, NULL, 0);
+        if (n <= 0) return map;
+        int cap = n / (int)sizeof(pid_t) + 64;
+        pid_t *pids = calloc((size_t)cap, sizeof(pid_t));
+        if (!pids) return map;
+        n = proc_listpids(PROC_ALL_PIDS, 0, pids, cap * (int)sizeof(pid_t));
+        if (n <= 0) { free(pids); return map; }
+        int count = n / (int)sizeof(pid_t);
+        if (count > cap) count = cap;
 
-    for (int i = 0; i < count; i++) {
-        @autoreleasepool {
-            pid_t pid = pids[i];
-            if (pid <= 0) continue;
-            NSString *bid = [self bundleIDForPid:pid];
-            if (bid.length && !map[bid]) map[bid] = @(pid);
+        for (int i = 0; i < count; i++) {
+            @autoreleasepool {
+                pid_t pid = pids[i];
+                if (pid <= 0) continue;
+                NSString *bid = [self bundleIDForPid:pid];
+                if (bid.length && !map[bid]) map[bid] = @(pid);
+            }
         }
+        free(pids);
+        return map;
+    } @catch (NSException *e) {
+        RBLog(@"runningPids 异常：%@", e.reason);
+        return @{};
     }
-    free(pids);
-    return map;
 }
 
 #pragma mark - 杀进程

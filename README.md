@@ -193,7 +193,73 @@ entitlements 仍是 12 条，一条没加。仍然没有：网络、IPC、`dlope
 | scene 挂载 | iOS 16/17/18 的 FrontBoard 类名/方法名有差异，失败会自动退回 RBS assertion（保活但可能重载 UI） |
 | 加速效果 | 只动第三方 App；系统 App、真后台白名单、8MB 以下的一律不动，所以「释放量」不会很夸张 |
 
-## 五、白苹果风险评估
+## 五、1.1.0：闪退定位 + 保留名单
+
+### 1. 闪退：找到两处真实的崩溃点
+
+第一版装上去点开就退。回头把启动路径逐行重读，找到两处**确定会崩**的地方：
+
+| # | 位置 | 为什么会崩 |
+|---|---|---|
+| 1 | `RBProcesses.m` `iconForPath:` | 原来把 `CFBundleIconFiles` 数组直接 `addObjectsFromArray:`，然后对每个元素取 `.pathExtension`。这个数组里混着 `NSNumber` / `NSNull` 的情况是真实存在的（plist 写得潦草的 App 就有），对非字符串发消息就是 `unrecognized selector` —— 而这段**不在任何 `@try` 里**。`reload` 在 `viewDidLoad` 就往后台线程跑了这条路径，所以表现就是「打开、闪一下、没了」 |
+| 2 | `RBRootVC.m` `showMenu` | 方法实现了，但 `@interface` 扩展里漏了声明。`@selector(showMenu)` 在编译期照样通过（我们关了 `-Wundeclared-selector` 警告），运行时点左上角按钮就是 `unrecognized selector` |
+
+第 1 条修法：所有图标名先过一层 `collect` 块，**逐元素校验 `isKindOfClass:[NSString class]`**；图标缓存加 `@synchronized`（并发刷新不再撞 `NSMutableDictionary`）；`installedApps` 整体再包一层 `@try`，单个 App 解析失败只跳过它。
+
+### 2. 另外三处「降低变量」的改动
+
+| 改动 | 理由 |
+|---|---|
+| `ARCHS := arm64`（去掉 arm64e） | 原来出双切片，A12 以上设备会优先加载 arm64e。arm64e 带指针认证，TrollStore 的 `ldid` 伪签名不做指针签名覆盖 —— 一旦这里出问题就是崩在 dyld，连崩溃日志都拿不到。A12+ 跑 arm64 是系统完整支持的，性能没有损失 |
+| 窗口 hook 从 `__attribute__((constructor))` 改成懒加载 | 构造函数跑在 **main 之前**，那时 UIKit 还没完成自己的初始化。去 `NSClassFromString` 摸它的私有类、再 `class_addMethod` 改方法表，任何一点意外都是秒退，而且崩在 pre-main 什么都抓不到。现在改成第一次真要挂 scene 时才装 |
+| entitlements 补 `com.apple.private.security.no-container` | 只给 `no-sandbox` 不给 `no-container` 时，`libsystem_secinit` 仍会去找本 App 的容器，容器不存在或权限不对就直接在启动瞬间中止进程。这两个必须成对出现 |
+
+顺带修的打包项：`Info.plist` 补 `CFBundleSupportedPlatforms`（缺了有的安装路径会判成非法包）；去掉 `UIRequiresFullScreen`（它在 iPad 上强制要求四个方向，而我们只声明了竖屏，启动时 UIKit 断言失败直接崩），iPad 单独给全套方向；`MinimumOSVersion` 与二进制的 `minos 14.0` 对齐。
+
+### 3. 就算还崩，也能知道崩在哪
+
+新增 `src/RBCrash.m`：
+
+- `main` 第一行就装 **未捕获异常处理器 + 六个致命信号**（SEGV/ABRT/BUS/ILL/FPE/TRAP），带独立信号栈（栈溢出也能写日志）
+- 崩溃现场用 `backtrace` + `dladdr` **反解成函数名**写进文件（二进制没 strip，能直接看出崩在哪个函数）
+- 日志与崩溃记录写在 App 容器的 Documents，配合 `UIFileSharingEnabled`，用户在 **「文件」App → 我的 iPhone → 真后台 Pro** 里直接就能看到并分享，不用连电脑
+- **安全模式**：下次启动如果发现有崩溃记录，就**不自动枚举**，先把界面打开并把崩溃内容弹出来。这样即使枚举还有问题，也不会陷入「一打开就退、什么都看不到」的死循环
+
+### 4. 保留名单（锁定）：不想让加速碰的 App
+
+这是这次新加的功能，对应「微信后台不能被清掉」这类需求。
+
+- **右滑**列表任意一行 → 「锁定保留」；再滑一次变「取消锁定」
+- 或**点进详情**，第一项就是「锁定（加速时保留）」
+- 顶部分段多出**「锁定」页**，只列已锁定的 App，一眼看清锁了哪些
+- 列表上锁定的 App 标签显示为**金色「已锁定」**，和绿色的真后台/自启区分开
+
+锁定的语义是**「别管它」**，所以它同时压过其它配置：
+
+| 场景 | 锁定后行为 |
+|---|---|
+| 一键加速 | 候选阶段就剔除，**永远不会被结束** |
+| 退出即杀 | 不执行（两个名单冲突时锁定优先，加入锁定时会自动把冲突项从退出即杀里移除） |
+| 自启恢复 | 跳过，不会去给它挂 scene |
+| 手动「杀后台」 | 拦下并提示「已锁定，先取消锁定」 |
+| 加速前的弹窗 | 明确写出「🔒 已锁定跳过 N 个（约 X MB）：微信、QQ…」，不是静默跳过 |
+| 加速结果 | 再报一次「锁定保留 N 个（约 X MB），没有被碰」 |
+
+列表底部的「可清理约 X MB」也已经是**扣掉锁定项之后**的数字，不会给你虚高的预期。
+
+实现上有三道闸：`RBBooster` 候选阶段排除 → `killApp:` 里再查一次 `lockIDs`（调用方漏传也杀不到）→ 界面层第三道拦截。名单存 `LockList`，与 `WhiteList` / `AutoStart` / `SuicideList` 一起在 `cn.bswbw.RealBG.plist`，读的时候同样过 `RBSanitizeSet` 类型校验。
+
+### 5. 「运行中」原来整体失效
+
+顺手修掉的一个不易察觉的 bug：`bundleIDForPid:` 截路径时用的是索引算术
+
+```objc
+exe substringToIndex: r.location + r2.location + r2.length     // 少加了 r.length
+```
+
+`r` 是 `/Bundle/Application/` 这个标记的 range。少加它的长度，截出来的路径整体左移 19 个字符，永远读不到 `Info.plist`，只能退化成用 `.app` 目录名当 bundleID。结果就是**进程枚举到的 bundleID 跟配置里存的对不上，「运行中」这个状态一直是错的**。现在改用字符串拼接，不再做索引算术。
+
+## 六、白苹果风险评估
 
 结论：**不会白苹果**。逐条说明为什么：
 
@@ -207,7 +273,7 @@ entitlements 仍是 12 条，一条没加。仍然没有：网络、IPC、`dlope
 
 ---
 
-## 六、测试与验证（都是真实跑过的，不是"应该没问题"）
+## 七、测试与验证（都是真实跑过的，不是"应该没问题"）
 
 ### 1. 产物硬校验 `tests/verify_tipa.py`（读真实字节）
 
@@ -225,7 +291,7 @@ V6 后门标记          com.example.myPort / CFMessagePort* / com.shadow.getEsp
 
 `V4` 不是"搜字符串有没有"，是真的把代码签名里的 SuperBlob 解开、把 entitlements 反序列化出来看的，12 条逐条列在脚本输出里。
 
-### 2. 源码逻辑测试 `tests/test_logic.py`（78 项，全通过）
+### 2. 源码逻辑测试 `tests/test_logic.py`（122 项，全通过）
 
 不是复述代码，而是**从真实源文件里解析出白名单/阈值/守卫**，再用这些真实数据跑判定：
 
@@ -237,7 +303,7 @@ V6 后门标记          com.example.myPort / CFMessagePort* / com.shadow.getEsp
 | 后门回归 | 去注释后扫 `task_for_pid` / `processor_set_tasks` / `CFMessagePort` / `NSURLSession` / `http` / `trollstorehelper` / `MSHookFunction` / `dlopen`，全部为 0 |
 | 配置路径 | 写入是 `cn.bswbw.RealBG.plist`；`com.thefool.app.plist` 只出现在 `dictionaryWithContentsOfFile:legacy` 一行，无 `writeToFile:legacy` |
 | entitlements | 条数 = 12，7 项高危 + `hid.*` 全部不在 |
-| 结构 | 8 个源文件齐、`ARCHS := arm64 arm64e`、application 目标（不是 tweak） |
+| 结构 | 9 个源文件齐、`ARCHS := arm64`（且断言不含 arm64e）、application 目标（不是 tweak） |
 
 CI 里两步都挂了：先跑 `test_logic.py`，出包后再跑 `verify_tipa.py`，任一失败就构建失败 —— 也就是说 dist 分支上的包，一定是这两关都过的。
 
@@ -259,7 +325,7 @@ CI 里两步都挂了：先跑 `test_logic.py`，出包后再跑 `verify_tipa.py
 第 1 项过不了（闪退）→ 多半是 iOS 版本与 `UIRootWindowScenePresentationBinder` 的类名差异，把 `设置 → 隐私 → 分析与改进 → 分析数据` 里的 `RealBG` 崩溃日志给我，能直接定位。
 第 3 项过不了 → 那台系统的 FBScene 路径变了，会看到日志「scene 方案异常」，会自动退回 RBS assertion 兜底（保活但 UI 状态可能重载）。
 
-## 七、目录结构
+## 八、目录结构
 
 ```
 Makefile                  Theos application 工程
@@ -279,7 +345,7 @@ tests/verify_tipa.py      产物硬校验（结构/Mach-O/签名 entitlements/�
 .github/workflows/build.yml  Theos 编译 → 组 .app → ldid 签 → 打 tipa → 硬校验 → 推 dist 分支
 ```
 
-## 八、构建
+## 九、构建
 
 CI 在 macOS runner 上跑 Theos，产物推到 `dist` 分支：
 
@@ -300,7 +366,7 @@ ldid -Sentitlements.plist "$APP/RealBG"
 mkdir -p Payload && cp -R "$APP" Payload/ && zip -qry RealBG.tipa Payload
 ```
 
-## 九、用法
+## 十、用法
 
 1. TrollStore 装 `RealBG.tipa`
 2. 打开要保活的 App，回本 App 里左滑 → **开启真后台**（或点右上「全部真后台」一键给所有运行中的 App 挂上）

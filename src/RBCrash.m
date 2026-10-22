@@ -25,6 +25,7 @@
 #import <string.h>
 #import <stdlib.h>
 #import <limits.h>
+#import <pthread.h>
 
 // 信号处理里不能做内存分配 / Objective-C 调用，所以路径提前算成 C 字符串。
 static char gCrashPath[PATH_MAX];
@@ -181,6 +182,11 @@ void RBDismissCrash(void) {
 
 /// 全程共用一个 fd，避免每条日志都要 open/close。
 /// 超过 256KB 就滚动一次，防止长期使用把用户磁盘写满。
+///
+/// 必须加锁：RBLog 会被 reload 线程、加速线程、退出清理线程同时调用，
+/// 而滚动时要做 close + open。不加锁的话两个线程可能同时判断「该滚动了」，
+/// 一个 close 掉刚被另一个打开的 fd —— 轻则日志错乱，重则把别人的 fd 关掉。
+/// 注意信号处理里绝对不能调 RBLog（会死锁），那里只用裸 write。
 void RBLog(NSString *fmt, ...) {
     va_list ap;
     va_start(ap, fmt);
@@ -191,23 +197,8 @@ void RBLog(NSString *fmt, ...) {
 
     static int fd = -1;
     static off_t written = 0;
+    static pthread_mutex_t lock = PTHREAD_MUTEX_INITIALIZER;
     static dispatch_once_t once;
-    dispatch_once(&once, ^{
-        if (gLogPath[0] == 0) {
-            snprintf(gLogPath, sizeof(gLogPath), "%s", [RBRunLogPath() UTF8String]);
-        }
-        fd = open(gLogPath, O_WRONLY | O_CREAT | O_APPEND, 0644);
-        NSDictionary *attr = [[NSFileManager defaultManager] attributesOfItemAtPath:RBRunLogPath() error:NULL];
-        written = (off_t)[attr[NSFileSize] longLongValue];
-    });
-    if (fd < 0) return;
-
-    if (written > 256 * 1024) {
-        close(fd);
-        fd = open(gLogPath, O_WRONLY | O_CREAT | O_TRUNC, 0644);
-        written = 0;
-        if (fd < 0) return;
-    }
 
     static NSDateFormatter *df;
     static dispatch_once_t once2;
@@ -219,8 +210,28 @@ void RBLog(NSString *fmt, ...) {
     NSString *line = [NSString stringWithFormat:@"%@  %@\n", [df stringFromDate:[NSDate date]], body];
     const char *utf8 = line.UTF8String;
     if (!utf8) return;
-    ssize_t n = write(fd, utf8, strlen(utf8));
-    if (n > 0) written += n;
+
+    pthread_mutex_lock(&lock);
+    dispatch_once(&once, ^{
+        if (gLogPath[0] == 0) {
+            snprintf(gLogPath, sizeof(gLogPath), "%s", [RBRunLogPath() UTF8String]);
+        }
+        fd = open(gLogPath, O_WRONLY | O_CREAT | O_APPEND, 0644);
+        NSDictionary *attr = [[NSFileManager defaultManager] attributesOfItemAtPath:RBRunLogPath() error:NULL];
+        written = (off_t)[attr[NSFileSize] longLongValue];
+    });
+    if (fd >= 0) {
+        if (written > 256 * 1024) {
+            close(fd);
+            fd = open(gLogPath, O_WRONLY | O_CREAT | O_TRUNC, 0644);
+            written = 0;
+        }
+        if (fd >= 0) {
+            ssize_t n = write(fd, utf8, strlen(utf8));
+            if (n > 0) written += n;
+        }
+    }
+    pthread_mutex_unlock(&lock);
 }
 
 NSString *RBHumanMB(double mb) {

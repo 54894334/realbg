@@ -259,6 +259,7 @@ check("@synchronized([RBProcesses class])" in pr, "图标缓存加锁（并发�
 check("stringWithFormat:@\"%@%@/%@\"" in pr,
       "bundle 路径用拼接，不用索引算术（1.0.x 少加 marker 长度导致全部解析失败）")
 check("installedApps 异常" in pr, "installedApps 整体兜底，枚举出错也不让进程死")
+check("runningPids 异常" in pr, "runningPids 也兜底，进程枚举出错不会炸整条刷新链")
 
 bt = strip_comments(root_src["RBBackstage.m"])
 check("__attribute__((constructor))" not in bt,
@@ -272,6 +273,9 @@ check("NSSetUncaughtExceptionHandler" in cr, "捕获未抛出的 ObjC 异常")
 check("sa_sigaction = RBSignalHandler" in cr, "捕获致命信号")
 check("SA_ONSTACK" in cr and "sigaltstack" in cr, "独立信号栈（栈溢出也能写日志）")
 check("dladdr" in cr, "把返回地址反解成函数名，日志能直接看出崩在哪")
+check("pthread_mutex_lock(&lock)" in cr and "pthread_mutex_unlock(&lock)" in cr,
+      "写日志加锁（多线程同时触发滚动时不会关掉别人正在用的 fd）")
+check("void RBAppendRaw" not in cr, "日志写入只有一条路径，不存在绕开锁的第二条写入口")
 check("UIFileSharingEnabled" in open(os.path.join(ROOT, "RealBG", "Info.plist"), encoding="utf-8").read(),
       "Info.plist 开了文件共享，日志能从「文件」App 取出来")
 check("RBInstallCrashHandler();" in mn and mn.index("RBInstallCrashHandler();") < mn.index("UIApplicationMain"),
