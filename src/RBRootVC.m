@@ -367,7 +367,7 @@ static UIColor *RBWarn(void)   { return [UIColor colorWithRed:1.00 green:0.42 bl
     }];
     kill.backgroundColor = RBWarn();
 
-    UIContextualAction *auto = [UIContextualAction contextualActionWithStyle:UIContextualActionStyleNormal
+    UIContextualAction *autoAct = [UIContextualAction contextualActionWithStyle:UIContextualActionStyleNormal
                                                                       title:(info.hasAutoStart ? @"取消自启" : @"加入自启")
                                                                     handler:^(UIContextualAction *action, UIView *v, void (^done)(BOOL)) {
         RBStore *s = [RBStore shared];
@@ -377,9 +377,9 @@ static UIColor *RBWarn(void)   { return [UIColor colorWithRed:1.00 green:0.42 bl
         [self reload];
         done(YES);
     }];
-    auto.backgroundColor = [UIColor colorWithWhite:0.28 alpha:1];
+    autoAct.backgroundColor = [UIColor colorWithWhite:0.28 alpha:1];
 
-    return [UISwipeActionsConfiguration configurationWithActions:@[kill, auto]];
+    return [UISwipeActionsConfiguration configurationWithActions:@[kill, autoAct]];
 }
 
 - (void)tableView:(UITableView *)tableView didSelectRowAtIndexPath:(NSIndexPath *)indexPath {
