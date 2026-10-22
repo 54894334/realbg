@@ -104,7 +104,7 @@ boost = read("RBBooster.m")
 m = re.search(r"if \(mb < (\d+)\) continue", boost)
 thresh = int(m.group(1)) if m else None
 check(thresh == 8, "跳过占用 < 8MB 的进程", "（源码阈值 %s）" % thresh)
-check('if ([protect containsObject:bid]) continue;' in boost, "真后台白名单不杀")
+check('if (exclude && [exclude containsObject:bid]) continue;' in boost, "真后台/锁定名单在候选阶段就排除")
 check('if ([protectedBundles containsObject:bid]) continue;' in boost, "系统应用不杀")
 check('if ([RBProcesses isSystemBundle:bid]) continue;' in boost, "com.apple.* 在候选阶段就被排除")
 check('if (pid <= 0 || pid == me) continue;' in boost, "跳过非法 pid 与自身")
@@ -162,7 +162,8 @@ check("bundleIDForPid" in root_src["RBProcesses.m"], "进程枚举复用同一�
 mn = root_src["main.m"]
 check("performSuicideCleanup" in mn and "applicationDidEnterBackground" in mn,
       "「退出即杀」名单真的执行（第一版只存不读，开关是摆设）")
-check("[protect containsObject:bid]" in mn, "退出清理时真后台白名单优先，不冲突误杀")
+check("[lock containsObject:bid]" in mn and "[backstage containsObject:bid]" in mn,
+      "退出清理时：锁定 > 真后台 > 退出即杀，优先级写在源码里")
 
 print("\n== 4. 源码级后门回归（原包有、本包必须没有） ==")
 all_src = "\n".join(strip_comments(read(f)) for f in sorted(os.listdir(SRC)) if f.endswith((".m", ".h")))
@@ -193,7 +194,9 @@ check("writeToFile:legacy" not in clean_store, "不写旧路径")
 
 print("\n== 6. entitlements 数量与危险项 ==")
 ents = plistlib.load(open(os.path.join(ROOT, "entitlements.plist"), "rb"))
-check(len(ents) == 12, "权限条数 = 12", "（实际 %d）" % len(ents))
+check(len(ents) == 13, "权限条数 = 13", "（实际 %d）" % len(ents))
+check("com.apple.private.security.no-container" in ents,
+      "no-container 与 no-sandbox 成对出现（只给 no-sandbox 会在启动瞬间被 secinit 杀掉）")
 DANGER = ["task_for_pid-allow", "com.apple.system-task-ports", "proc_info-allow",
           "get-task-allow", "com.apple.private.persona-mgmt",
           "com.apple.private.kernel.jetsam", "com.apple.private.memorystatus"]
@@ -203,11 +206,89 @@ check(any(k.startswith("com.apple.private.hid") for k in ents) is False, "无 hi
 
 print("\n== 7. 结构完整性 ==")
 for f in ["RB.h", "rbproc.h", "main.m", "RBStore.m", "RBProcesses.m",
-          "RBBackstage.m", "RBBooster.m", "RBRootVC.m"]:
+          "RBBackstage.m", "RBBooster.m", "RBRootVC.m", "RBCrash.m"]:
     check(os.path.exists(os.path.join(SRC, f)), "存在 src/%s" % f)
 mk = open(os.path.join(ROOT, "Makefile"), encoding="utf-8").read()
-check("ARCHS := arm64 arm64e" in mk, "Makefile 同时出 arm64 + arm64e")
+check("ARCHS := arm64" in mk, "Makefile 出 arm64 切片")
+_mk_code = "\n".join(l.split("#")[0] for l in mk.split("\n"))   # Makefile 注释是 #
+check("arm64e" not in _mk_code,
+      "不再出 arm64e（TrollStore 伪签名不覆盖 PAC，arm64e 是秒退高发区）")
 check("application.mk" in mk, "Makefile 是 application 目标（不是 tweak）")
+
+print("\n== 8. 1.1.0 新增：保留名单（锁定） ==")
+st = strip_comments(root_src["RBStore.m"])
+check('@"LockList"' in st, "配置里持久化 LockList（重启后锁定不丢）")
+check("[RBSanitizeSet(d[@\"LockList\"])" in st, "LockList 也走类型校验（坏 plist 不崩）")
+check("allProtectedIDs" in st and "unionSet:self.lockIDs" in st,
+      "allProtectedIDs 合并真后台 + 锁定，加速与清理共用一份")
+
+bo = strip_comments(root_src["RBBooster.m"])
+check("rawCandidatesExcluding" in bo, "候选枚举抽成单一实现，两边数字不会对不上")
+check("lockedCandidatesProtecting" in bo, "能算出「因为锁定才保住」的进程")
+check("[excl minusSet:lock]" in bo, "故意不排除锁定项，才能把它们筛出来展示")
+check('@"lockedSkipped"' in bo and '@"lockedKeptMB"' in bo,
+      "加速结果带回锁定跳过数与保住的内存")
+check("RBStore shared].lockIDs" in bo, "锁定名单直接取自 store，不靠调用方传")
+
+pr = strip_comments(root_src["RBProcesses.m"])
+check("[[RBStore shared].lockIDs containsObject:bundleID]" in pr,
+      "killApp: 里再拦一次锁定（调用方漏传也杀不到）")
+
+vc = strip_comments(root_src["RBRootVC.m"])
+check("toggleLock:" in vc, "有独立的锁定/解锁动作")
+check("@\"锁定保留\"" in vc and "@\"取消锁定\"" in vc, "右滑有「锁定保留 / 取消锁定」")
+check("加速时保留" in vc, "详情菜单里也有一键锁定")
+check('@[@"全部", @"运行", @"保活", @"自启", @"锁定"]' in vc, "分段里有「锁定」页")
+check("self.tab == 4 && !i.locked" in vc, "「锁定」页只列已锁定的")
+check("已锁定跳过" in vc, "加速前的弹窗明确写「已锁定跳过 N 个」")
+check("锁定保留 %lu 个" in vc, "加速结果里也报锁定保留数量")
+check("info.locked" in vc and "已锁定，先取消锁定" in vc, "锁定项手动「杀后台」也会被拦")
+
+mn = strip_comments(root_src["main.m"])
+check("[lock containsObject:bid]" in mn, "退出清理尊重锁定（锁定优先于退出即杀）")
+check("if ([lock containsObject:bid]) continue;" in mn and "restoreAutoStart" in mn,
+      "自启恢复也会跳过锁定的 App")
+
+print("\n== 9. 1.1.0 修掉的两处闪退 / 功能失效 ==")
+check("collect(((NSDictionary *)primary)[@\"CFBundleIconFiles\"])" in pr,
+      "图标名走 collect 过滤（原来 addObjectsFromArray 直接把非字符串塞进去）")
+check("[x isKindOfClass:[NSString class]]" in pr,
+      "CFBundleIconFiles 的元素逐个校验类型（NSNumber/NSNull 不再 unrecognized selector）")
+check("addObjectsFromArray:legacy" not in pr, "不再有未过滤的 addObjectsFromArray")
+check("@synchronized([RBProcesses class])" in pr, "图标缓存加锁（并发刷新不撞 NSMutableDictionary）")
+check("stringWithFormat:@\"%@%@/%@\"" in pr,
+      "bundle 路径用拼接，不用索引算术（1.0.x 少加 marker 长度导致全部解析失败）")
+check("installedApps 异常" in pr, "installedApps 整体兜底，枚举出错也不让进程死")
+
+bt = strip_comments(root_src["RBBackstage.m"])
+check("__attribute__((constructor))" not in bt,
+      "不再在 pre-main 的构造函数里碰 UIKit（改成懒加载）")
+check("RBInstallSceneWindowHooksIfNeeded" in bt and "dispatch_once" in bt,
+      "窗口 hook 改为首次使用时安装一次")
+
+print("\n== 10. 1.1.0 新增：崩溃捕获 / 安全模式 ==")
+cr = strip_comments(root_src["RBCrash.m"])
+check("NSSetUncaughtExceptionHandler" in cr, "捕获未抛出的 ObjC 异常")
+check("sa_sigaction = RBSignalHandler" in cr, "捕获致命信号")
+check("SA_ONSTACK" in cr and "sigaltstack" in cr, "独立信号栈（栈溢出也能写日志）")
+check("dladdr" in cr, "把返回地址反解成函数名，日志能直接看出崩在哪")
+check("UIFileSharingEnabled" in open(os.path.join(ROOT, "RealBG", "Info.plist"), encoding="utf-8").read(),
+      "Info.plist 开了文件共享，日志能从「文件」App 取出来")
+check("RBInstallCrashHandler();" in mn and mn.index("RBInstallCrashHandler();") < mn.index("UIApplicationMain"),
+      "main 里在 UIApplicationMain 之前就装好捕获")
+check("safeMode" in vc and "RBReadLastCrash().length > 0" in vc,
+      "上次崩过就进安全模式，不自动枚举（保证界面能打开）")
+check("if (!self.safeMode) [self reload];" in vc, "安全模式下不自动 reload")
+check("if (apps.count > 0) self.safeMode = NO;" in vc, "枚举成功才退出安全模式")
+
+print("\n== 11. 1.1.0 打包配置 ==")
+ipl = open(os.path.join(ROOT, "RealBG", "Info.plist"), encoding="utf-8").read()
+check("CFBundleSupportedPlatforms" in ipl, "声明 CFBundleSupportedPlatforms（缺了有的安装路径判为非法包）")
+check("<key>UIRequiresFullScreen</key>" not in ipl,
+      "去掉 UIRequiresFullScreen（iPad 上强制四方向，只声明竖屏会断言崩溃）")
+check("UISupportedInterfaceOrientations~ipad" in ipl, "iPad 单独声明四个方向")
+check("LSSupportsOpeningDocumentsInPlace" in ipl, "文件 App 可直接打开日志目录")
+check("<string>1.1.0</string>" in ipl, "Info.plist 版本 1.1.0")
 
 print("\n" + "=" * 56)
 print("通过 %d 项，失败 %d 项" % (len(passed), len(failed)))

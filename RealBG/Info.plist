@@ -17,17 +17,25 @@
     <key>CFBundlePackageType</key>
     <string>APPL</string>
     <key>CFBundleShortVersionString</key>
-    <string>1.0.1</string>
+    <string>1.1.0</string>
     <key>CFBundleVersion</key>
-    <string>2</string>
+    <string>3</string>
+
+    <!-- 标明这是 iOS 应用。缺这一项时有的安装路径会判定成非法包 -->
+    <key>CFBundleSupportedPlatforms</key>
+    <array>
+        <string>iPhoneOS</string>
+    </array>
+
     <key>CFBundleIconFiles</key>
     <array>
         <string>AppIcon60x60</string>
     </array>
+
     <key>LSRequiresIPhoneOS</key>
     <true/>
     <key>MinimumOSVersion</key>
-    <string>15.0</string>
+    <string>14.0</string>
     <key>UIDeviceFamily</key>
     <array>
         <integer>1</integer>
@@ -43,13 +51,30 @@
     <string>UIStatusBarStyleLightContent</string>
     <key>UIViewControllerBasedStatusBarAppearance</key>
     <false/>
+
     <key>UISupportedInterfaceOrientations</key>
     <array>
         <string>UIInterfaceOrientationPortrait</string>
     </array>
+    <!-- iPad 上如果只声明竖屏，UIKit 会在启动时断言失败直接崩。
+         所以 iPad 单独给全套方向，并且不再声明 UIRequiresFullScreen
+         （它强制要求四个方向都支持）。 -->
+    <key>UISupportedInterfaceOrientations~ipad</key>
+    <array>
+        <string>UIInterfaceOrientationPortrait</string>
+        <string>UIInterfaceOrientationPortraitUpsideDown</string>
+        <string>UIInterfaceOrientationLandscapeLeft</string>
+        <string>UIInterfaceOrientationLandscapeRight</string>
+    </array>
+
     <key>UIApplicationSupportsIndirectInputEvents</key>
     <true/>
-    <key>UIRequiresFullScreen</key>
+
+    <!-- 让日志和崩溃记录出现在「文件」App → 我的 iPhone → 真后台 Pro，
+         用户可以直接分享出来，不用连电脑。 -->
+    <key>UIFileSharingEnabled</key>
+    <true/>
+    <key>LSSupportsOpeningDocumentsInPlace</key>
     <true/>
 </dict>
 </plist>

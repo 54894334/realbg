@@ -8,11 +8,13 @@
 //    · 不引入任何网络代码（原包也无外发，只有 t.me / PayPal / 支付宝三个跳转按钮）
 //    · 修掉原包写死 com.thefool.app.plist 的配置路径 bug
 //    · 新增「一键加速」：批量结束后台进程并统计释放内存
+//    · 新增「保留名单（锁定）」：锁住的 App 永远不会被加速/退出清理碰到
+//    · 新增崩溃捕获与运行日志：闪退现场落盘，下次启动界面直接显示
 //
 #import <UIKit/UIKit.h>
 #import <Foundation/Foundation.h>
 
-#define RB_VERSION @"1.0.1"
+#define RB_VERSION @"1.1.0"
 #define RB_BUNDLE @"cn.bswbw.RealBG"
 
 // 配置：/var/mobile/Library/Preferences/cn.bswbw.RealBG.plist
@@ -30,7 +32,8 @@
 @property (nonatomic, assign) pid_t     pid;
 @property (nonatomic, assign) BOOL      hasBackstage;   // 已开真后台
 @property (nonatomic, assign) BOOL      hasAutoStart;   // 已加自启
-@property (nonatomic, assign) BOOL      hasSuicide;     // 切后台即杀（省内存）
+@property (nonatomic, assign) BOOL      hasSuicide;     // 退出本 App 时结束
+@property (nonatomic, assign) BOOL      locked;         // 已锁定：加速永不清理
 @end
 
 #pragma mark - 配置
@@ -39,16 +42,20 @@
 @property (nonatomic, strong) NSMutableSet *backstageIDs;
 @property (nonatomic, strong) NSMutableSet *autoStartIDs;
 @property (nonatomic, strong) NSMutableSet *suicideIDs;
+/// 保留名单。一键加速、退出清理都不会碰这里面的 App。
+@property (nonatomic, strong) NSMutableSet *lockIDs;
 @property (nonatomic, assign) BOOL boostOnLaunch;   // 启动时自动加速一次
 + (instancetype)shared;
 - (void)save;
 - (void)reload;
+/// 加速/清理时应当保护的全部 bundleID（真后台 + 锁定，合并后返回）
+- (NSSet *)allProtectedIDs;
 @end
 
 #pragma mark - 进程层
 
 @interface RBProcesses : NSObject
-/// 已安装应用（含系统应用），按 bundleID 排序
+/// 已安装应用（含系统应用），系统应用排在后面
 + (NSArray<RBAppInfo *> *)installedApps;
 /// 正在运行的 pids（bundleID -> pid）
 + (NSDictionary<NSString *, NSNumber *> *)runningPids;
@@ -83,13 +90,14 @@
 #pragma mark - 一键加速
 
 @interface RBBooster : NSObject
-/// 批量结束后台进程。protect: 不杀的 bundleID（真后台白名单）
-/// 返回 @{@"killed", @"failed", @"freedMB", @"beforeMB", @"afterMB", @"details"}
+/// 批量结束后台进程。protect: 不杀的 bundleID（真后台 + 锁定名单）
+/// 返回 @{@"killed", @"failed", @"freedMB", @"beforeMB", @"afterMB",
+///        @"lockedSkipped", @"details", @"lockedNames"}
 + (NSDictionary *)boostProtecting:(NSSet *)protect;
-/// 预估可释放内存
-+ (double)estimatedReclaimMB;
 /// 可清理候选（按占用内存降序），元素：@{bundleID, pid, mb, estimated}
 + (NSArray<NSDictionary *> *)candidatesProtecting:(NSSet *)protect;
+/// 被保留名单挡下、本来会被清理的进程（用来在界面上说明「省下了多少」）
++ (NSArray<NSDictionary *> *)lockedCandidatesProtecting:(NSSet *)protect;
 /// 单个进程的真实物理占用（phys_footprint，MB）
 + (double)footprintMBForPid:(pid_t)pid;
 @end
@@ -103,3 +111,16 @@
 
 FOUNDATION_EXPORT void RBLog(NSString *fmt, ...);
 FOUNDATION_EXPORT NSString *RBHumanMB(double mb);
+
+#pragma mark - 崩溃捕获
+
+/// 装未捕获异常 + 致命信号的处理。越早调用越好（main 第一行）。
+FOUNDATION_EXPORT void RBInstallCrashHandler(void);
+/// 上一次运行留下的崩溃记录（没有则 nil）。main 启动时读，界面显示。
+FOUNDATION_EXPORT NSString *RBReadLastCrash(void);
+/// 用户看完后清掉
+FOUNDATION_EXPORT void RBDismissCrash(void);
+FOUNDATION_EXPORT NSString *RBCrashLogPath(void);
+FOUNDATION_EXPORT NSString *RBRunLogPath(void);
+/// 日志所在目录（界面上要告诉用户去哪找）
+FOUNDATION_EXPORT NSString *RBLogDirPath(void);

@@ -19,6 +19,7 @@ EXPECT_INFO = {"CFBundleIdentifier": "cn.bswbw.RealBG", "CFBundleExecutable": "R
 MUST_HAVE = [
     "platform-application",
     "com.apple.private.security.no-sandbox",
+    "com.apple.private.security.no-container",
     "com.apple.runningboard.terminateprocess",
     "com.apple.runningboard.process-state",
     "com.apple.runningboard.targetidentities",
@@ -169,6 +170,35 @@ def main(path):
     ok("版本 = %s (build %s)" % (ip.get("CFBundleShortVersionString"), ip.get("CFBundleVersion")))
     ok("MinimumOSVersion = %s  UIDeviceFamily = %s" % (ip.get("MinimumOSVersion"), ip.get("UIDeviceFamily")))
 
+    if ip.get("CFBundleShortVersionString") == "1.1.0":
+        ok("版本号 = 1.1.0")
+    else:
+        bad("版本号不是 1.1.0（实际 %r）" % ip.get("CFBundleShortVersionString"))
+
+    if "iPhoneOS" in (ip.get("CFBundleSupportedPlatforms") or []):
+        ok("CFBundleSupportedPlatforms 含 iPhoneOS")
+    else:
+        bad("CFBundleSupportedPlatforms 缺失（有的安装路径会判成非法包）")
+
+    if ip.get("UIFileSharingEnabled"):
+        ok("UIFileSharingEnabled = true（日志能从「文件」App 取出）")
+    else:
+        bad("没开 UIFileSharingEnabled，用户取不到崩溃日志")
+
+    if ip.get("LSSupportsOpeningDocumentsInPlace"):
+        ok("LSSupportsOpeningDocumentsInPlace = true")
+    else:
+        warn("没开 LSSupportsOpeningDocumentsInPlace")
+
+    if "<key>UIRequiresFullScreen</key>" in z.read("Payload/RealBG.app/Info.plist").decode("utf-8", "replace"):
+        bad("仍然声明 UIRequiresFullScreen（iPad 上要求四方向，只写竖屏会崩）")
+    else:
+        ok("未声明 UIRequiresFullScreen")
+    if ip.get("UISupportedInterfaceOrientations~ipad"):
+        ok("iPad 单独声明了方向")
+    else:
+        warn("没有 UISupportedInterfaceOrientations~ipad")
+
     # ---------- V3 ----------
     print("\nV3 Mach-O")
     bin_data = z.read("Payload/RealBG.app/RealBG")
@@ -179,6 +209,16 @@ def main(path):
     for name, sb, ft in slices:
         ftn = {2: "MH_EXECUTE", 6: "MH_DYLIB"}.get(ft, str(ft))
         (ok if ft == 2 else bad)("  %-7s %-11s %d B" % (name, ftn, len(sb)))
+
+    slice_names = [n for n, _, _ in slices]
+    if "arm64e" in slice_names:
+        bad("产物里还有 arm64e 切片（TrollStore 的 ldid 不覆盖 PAC，是秒退高发区）")
+    else:
+        ok("没有 arm64e 切片")
+    if "arm64" in slice_names:
+        ok("有 arm64 切片（A12 以上设备会走它）")
+    else:
+        bad("没有 arm64 切片")
 
     # ---------- V4 ----------
     print("\nV4 签名里的 entitlements（解 SuperBlob，不是查字符串）")

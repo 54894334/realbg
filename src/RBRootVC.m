@@ -1,19 +1,24 @@
 //
 //  RBRootVC.m — 主界面
 //
-//  布局沿用原版（分段：全部/运行中/真后台/自启 + 搜索 + 左右滑动操作），
-//  底部新增一条「一键加速」。原版没有这个键，它的清内存要一个个 App 点「杀后台」。
+//  布局沿用原版（分段 + 搜索 + 左右滑动操作），底部一条「一键加速」。
 //
-//  这一版修掉的界面层问题：
-//    · 表格数据在刷新瞬间变短时，indexPath 越界会 NSRangeException 崩溃 —— 所有取值加边界判断
-//    · 「一键加速」原来在主线程枚举全系统进程 + 逐个读 Info.plist，会卡住界面 —— 改成后台线程
-//    · 内存标签每次都要重算「可清理」，和刷新重复扫两遍进程 —— 合并成一次
-//    · 弹窗还在展示时又去 present，会出现「already presenting」导致提示直接不显示 —— 统一走 presentAlert:
+//  1.1.0 新增：
+//    · 「保留名单（锁定）」：右滑或详情里一键锁定，锁住的 App 加速/清理永不碰
+//    · 加速前的弹窗明确列出「已锁定 N 个不会被结束」，不是静默跳过
+//    · 诊断入口：显示日志文件位置、把上次崩溃现场直接摊开
+//    · 安全模式：上次启动崩过，这次就不自动枚举（先让界面能开，点刷新再试）
+//
+//  仍然保留的界面层防护：
+//    · 表格取值一律走 infoAtIndex:，越界返回 nil（刷新瞬间数据变短不会 NSRangeException）
+//    · 枚举全在后台线程，按钮先变「正在统计…」
+//    · 弹窗统一走 presentAlert:，避免 already presenting 导致提示不显示
 //
 #import "RB.h"
 
 static UIColor *RBAccent(void) { return [UIColor colorWithRed:0.16 green:0.78 blue:0.55 alpha:1]; }
 static UIColor *RBWarn(void)   { return [UIColor colorWithRed:1.00 green:0.42 blue:0.35 alpha:1]; }
+static UIColor *RBLock(void)   { return [UIColor colorWithRed:1.00 green:0.78 blue:0.28 alpha:1]; }
 
 #pragma mark - Cell
 
@@ -78,11 +83,12 @@ static UIColor *RBWarn(void)   { return [UIColor colorWithRed:1.00 green:0.42 bl
     CGFloat w = self.contentView.bounds.size.width;
     _iconView2.frame = CGRectMake(16, (h - 44) / 2.0, 44, 44);
     CGFloat tx = CGRectGetMaxX(_iconView2.frame) + 12;
-    CGFloat textW = MAX(40, w - tx - 96);
+    CGFloat stateW = 104;
+    CGFloat textW = MAX(40, w - tx - stateW - 12);
     _nameLabel.frame = CGRectMake(tx, h / 2.0 - 20, textW, 22);
     _bidLabel.frame  = CGRectMake(tx, h / 2.0 + 2, textW, 16);
-    _stateLabel.frame = CGRectMake(w - 100, h / 2.0 - 9, 86, 18);
-    _spin.frame = CGRectMake(w - 34, (h - 20) / 2.0, 20, 20);
+    _stateLabel.frame = CGRectMake(w - stateW - 12, h / 2.0 - 9, stateW, 18);
+    _spin.frame = CGRectMake(w - 26, (h - 20) / 2.0, 20, 20);
 }
 
 - (void)bind:(RBAppInfo *)info {
@@ -90,20 +96,31 @@ static UIColor *RBWarn(void)   { return [UIColor colorWithRed:1.00 green:0.42 bl
     self.bidLabel.text = info.bundleID;
     self.iconView2.image = info.icon ?: [UIImage systemImageNamed:@"app.dashed"];
 
-    NSMutableArray *tags = [NSMutableArray array];
+    // 标签最多显示两个，其余折成「+N」—— 四个标签挤在一行会互相顶掉
+    NSMutableArray<NSString *> *tags = [NSMutableArray array];
+    if (info.locked)       [tags addObject:@"已锁定"];
     if (info.hasBackstage) [tags addObject:@"真后台"];
-    if (info.hasAutoStart) [tags addObject:@"自启"];
     if (info.hasSuicide)   [tags addObject:@"退出即杀"];
+    if (info.hasAutoStart) [tags addObject:@"自启"];
 
+    NSString *state = nil;
+    if (tags.count == 0) {
+        state = info.isRunning ? @"运行中" : @"未运行";
+    } else if (tags.count <= 2) {
+        state = [tags componentsJoinedByString:@"·"];
+    } else {
+        state = [NSString stringWithFormat:@"%@ +%lu", tags[0], (unsigned long)(tags.count - 1)];
+    }
+    self.stateLabel.text = state;
+
+    UIColor *onColor = info.locked ? RBLock() : RBAccent();
     if (info.isRunning) {
         self.spin.hidden = NO;
         [self.spin startAnimating];
-        self.stateLabel.text = tags.count ? [tags componentsJoinedByString:@"·"] : @"运行中";
-        self.stateLabel.textColor = tags.count ? RBAccent() : [UIColor colorWithWhite:1 alpha:0.45];
+        self.stateLabel.textColor = tags.count ? onColor : [UIColor colorWithWhite:1 alpha:0.45];
     } else {
         [self.spin stopAnimating];
-        self.stateLabel.text = tags.count ? [tags componentsJoinedByString:@"·"] : @"未运行";
-        self.stateLabel.textColor = tags.count ? RBAccent() : [UIColor colorWithWhite:1 alpha:0.28];
+        self.stateLabel.textColor = tags.count ? onColor : [UIColor colorWithWhite:1 alpha:0.28];
     }
 }
 
@@ -120,12 +137,14 @@ static UIColor *RBWarn(void)   { return [UIColor colorWithRed:1.00 green:0.42 bl
 
 @property (nonatomic, strong) NSArray<RBAppInfo *> *allApps;
 @property (nonatomic, strong) NSArray<RBAppInfo *> *shown;
-@property (nonatomic, assign) NSInteger tab;      // 0 全部 1 运行中 2 真后台 3 自启
+@property (nonatomic, assign) NSInteger tab;      // 0 全部 1 运行 2 保活 3 自启 4 锁定
 @property (nonatomic, copy)   NSString *query;
 
 @property (nonatomic, assign) BOOL loading;
 @property (nonatomic, assign) BOOL pendingReload;
 @property (nonatomic, assign) BOOL boostBusy;
+@property (nonatomic, assign) BOOL safeMode;
+@property (nonatomic, assign) BOOL crashPrompted;
 
 @property (nonatomic, assign) double usedMB;
 @property (nonatomic, assign) double freeMB;
@@ -142,12 +161,16 @@ static UIColor *RBWarn(void)   { return [UIColor colorWithRed:1.00 green:0.42 bl
 - (void)segChanged;
 - (void)appDidBecomeActive;
 - (void)toggleBackstage:(RBAppInfo *)info;
+- (void)toggleLock:(RBAppInfo *)info;
 - (void)enableAllRunning;
 - (void)tapBoost;
 - (void)doBoostWithCandidates:(NSArray *)cands;
 - (void)toast:(NSString *)s;
 - (void)presentAlert:(UIAlertController *)ac;
 - (void)reloadAfterDelay;
+- (void)showMenu;
+- (void)showDiag;
+- (void)promptLastCrashIfAny;
 @end
 
 @implementation RBRootVC
@@ -161,6 +184,9 @@ static UIColor *RBWarn(void)   { return [UIColor colorWithRed:1.00 green:0.42 bl
     self.navigationController.navigationBar.barStyle = UIBarStyleBlack;
     self.navigationController.navigationBar.tintColor = [UIColor whiteColor];
 
+    // 上次启动崩过就先别自动枚举 —— 先保证界面能打开，让用户看到崩溃记录
+    self.safeMode = (RBReadLastCrash().length > 0);
+
     [self buildSeg];
     [self buildTable];
     [self buildBoost];
@@ -170,10 +196,14 @@ static UIColor *RBWarn(void)   { return [UIColor colorWithRed:1.00 green:0.42 bl
         [[UIBarButtonItem alloc] initWithTitle:@"刷新" style:UIBarButtonItemStylePlain
                                         target:self action:@selector(reload)];
     self.navigationItem.leftBarButtonItem =
-        [[UIBarButtonItem alloc] initWithTitle:@"全部真后台" style:UIBarButtonItemStylePlain
-                                        target:self action:@selector(enableAllRunning)];
+        [[UIBarButtonItem alloc] initWithBarButtonSystemItem:UIBarButtonSystemItemAction
+                                                     target:self action:@selector(showMenu)];
 
-    [self reload];
+    if (self.safeMode) {
+        self.memLabel.text = @"上次启动异常，已进入安全模式 · 点右上「刷新」重试";
+    } else {
+        [self reload];
+    }
 
     [[NSNotificationCenter defaultCenter] addObserver:self
                                              selector:@selector(appDidBecomeActive)
@@ -183,19 +213,22 @@ static UIColor *RBWarn(void)   { return [UIColor colorWithRed:1.00 green:0.42 bl
 
 - (void)viewDidAppear:(BOOL)animated {
     [super viewDidAppear:animated];
-    [self reload];
+    [self promptLastCrashIfAny];
+    if (!self.safeMode) [self reload];
 }
 
 - (void)appDidBecomeActive {
-    [self reload];
+    if (!self.safeMode) [self reload];
 }
 
 #pragma mark 布局
 
 - (void)buildSeg {
-    self.seg = [[UISegmentedControl alloc] initWithItems:@[@"全部", @"运行中", @"真后台", @"自启"]];
+    self.seg = [[UISegmentedControl alloc] initWithItems:@[@"全部", @"运行", @"保活", @"自启", @"锁定"]];
     self.seg.selectedSegmentIndex = 0;
-    self.seg.selectedSegmentTintColor = [UIColor colorWithWhite:1 alpha:0.16];
+    if (@available(iOS 13.0, *)) {
+        self.seg.selectedSegmentTintColor = [UIColor colorWithWhite:1 alpha:0.16];
+    }
     [self.seg setTitleTextAttributes:@{NSForegroundColorAttributeName: [UIColor whiteColor]}
                              forState:UIControlStateNormal];
     [self.seg addTarget:self action:@selector(segChanged) forControlEvents:UIControlEventValueChanged];
@@ -203,9 +236,9 @@ static UIColor *RBWarn(void)   { return [UIColor colorWithRed:1.00 green:0.42 bl
     [self.view addSubview:self.seg];
     [NSLayoutConstraint activateConstraints:@[
         [self.seg.topAnchor constraintEqualToAnchor:self.view.safeAreaLayoutGuide.topAnchor constant:8],
-        [self.seg.leadingAnchor constraintEqualToAnchor:self.view.leadingAnchor constant:16],
-        [self.seg.trailingAnchor constraintEqualToAnchor:self.view.trailingAnchor constant:-16],
-        [self.seg.heightAnchor constraintEqualToConstant:34],
+        [self.seg.leadingAnchor constraintEqualToAnchor:self.view.leadingAnchor constant:12],
+        [self.seg.trailingAnchor constraintEqualToAnchor:self.view.trailingAnchor constant:-12],
+        [self.seg.heightAnchor constraintEqualToConstant:32],
     ]];
 }
 
@@ -232,6 +265,7 @@ static UIColor *RBWarn(void)   { return [UIColor colorWithRed:1.00 green:0.42 bl
     self.memLabel = [UILabel new];
     self.memLabel.textColor = [UIColor colorWithWhite:1 alpha:0.6];
     self.memLabel.font = [UIFont systemFontOfSize:12];
+    self.memLabel.numberOfLines = 2;
     self.memLabel.text = @"正在读取内存…";
     self.memLabel.translatesAutoresizingMaskIntoConstraints = NO;
     [bar addSubview:self.memLabel];
@@ -251,15 +285,15 @@ static UIColor *RBWarn(void)   { return [UIColor colorWithRed:1.00 green:0.42 bl
         [bar.trailingAnchor constraintEqualToAnchor:self.view.trailingAnchor],
         [bar.bottomAnchor constraintEqualToAnchor:self.view.bottomAnchor],
 
-        [self.memLabel.topAnchor constraintEqualToAnchor:bar.topAnchor constant:10],
+        [self.memLabel.topAnchor constraintEqualToAnchor:bar.topAnchor constant:8],
         [self.memLabel.leadingAnchor constraintEqualToAnchor:bar.leadingAnchor constant:20],
         [self.memLabel.trailingAnchor constraintEqualToAnchor:bar.trailingAnchor constant:-20],
 
-        [self.boostButton.topAnchor constraintEqualToAnchor:self.memLabel.bottomAnchor constant:8],
+        [self.boostButton.topAnchor constraintEqualToAnchor:self.memLabel.bottomAnchor constant:6],
         [self.boostButton.leadingAnchor constraintEqualToAnchor:bar.leadingAnchor constant:16],
         [self.boostButton.trailingAnchor constraintEqualToAnchor:bar.trailingAnchor constant:-16],
-        [self.boostButton.heightAnchor constraintEqualToConstant:52],
-        [self.boostButton.bottomAnchor constraintEqualToAnchor:bar.safeAreaLayoutGuide.bottomAnchor constant:-10],
+        [self.boostButton.heightAnchor constraintEqualToConstant:50],
+        [self.boostButton.bottomAnchor constraintEqualToAnchor:bar.safeAreaLayoutGuide.bottomAnchor constant:-8],
 
         [self.tableView.topAnchor constraintEqualToAnchor:self.seg.bottomAnchor constant:8],
         [self.tableView.leadingAnchor constraintEqualToAnchor:self.view.leadingAnchor],
@@ -293,6 +327,7 @@ static UIColor *RBWarn(void)   { return [UIColor colorWithRed:1.00 green:0.42 bl
         NSArray *apps = [RBProcesses installedApps];
         NSDictionary *running = [RBProcesses runningPids];
         RBStore *store = [RBStore shared];
+        NSSet *protect = [store allProtectedIDs];
 
         for (RBAppInfo *i in apps) {
             NSNumber *pid = running[i.bundleID];
@@ -301,6 +336,7 @@ static UIColor *RBWarn(void)   { return [UIColor colorWithRed:1.00 green:0.42 bl
             i.hasBackstage = [store.backstageIDs containsObject:i.bundleID];
             i.hasAutoStart = [store.autoStartIDs containsObject:i.bundleID];
             i.hasSuicide = [store.suicideIDs containsObject:i.bundleID];
+            i.locked = [store.lockIDs containsObject:i.bundleID];
         }
 
         // 内存与「可清理」只在这里算一次，别在每次刷新界面时重算
@@ -308,9 +344,11 @@ static UIColor *RBWarn(void)   { return [UIColor colorWithRed:1.00 green:0.42 bl
         double freeMB = [RBProcesses freeMemoryMB];
         BOOL hasMemory = (used + freeMB) > 1.0;
         double est = 0;
-        for (NSDictionary *d in [RBBooster candidatesProtecting:store.backstageIDs]) {
+        for (NSDictionary *d in [RBBooster candidatesProtecting:protect]) {
             est += [d[@"mb"] doubleValue];
         }
+
+        NSUInteger lockCount = store.lockIDs.count;
 
         dispatch_async(dispatch_get_main_queue(), ^{
             self.allApps = [apps copy];
@@ -319,8 +357,14 @@ static UIColor *RBWarn(void)   { return [UIColor colorWithRed:1.00 green:0.42 bl
             self.estimateMB = est;
             self.hasMemory = hasMemory;
             self.loading = NO;
+            if (apps.count > 0) self.safeMode = NO;    // 枚举成功就退出安全模式
             [self applyFilter];
             [self updateMemoryLabel];
+
+            if (lockCount > 0) {
+                self.memLabel.text = [self.memLabel.text stringByAppendingFormat:@" · 锁定 %lu",
+                                      (unsigned long)lockCount];
+            }
 
             if (self.pendingReload) {
                 self.pendingReload = NO;
@@ -337,6 +381,7 @@ static UIColor *RBWarn(void)   { return [UIColor colorWithRed:1.00 green:0.42 bl
         if (self.tab == 1 && !i.isRunning) continue;
         if (self.tab == 2 && !i.hasBackstage) continue;
         if (self.tab == 3 && !i.hasAutoStart) continue;
+        if (self.tab == 4 && !i.locked) continue;
         if (q.length) {
             BOOL hit = [i.name.lowercaseString containsString:q] ||
                        [i.bundleID.lowercaseString containsString:q];
@@ -350,7 +395,7 @@ static UIColor *RBWarn(void)   { return [UIColor colorWithRed:1.00 green:0.42 bl
 
 - (void)updateMemoryLabel {
     if (!self.hasMemory) {
-        self.memLabel.text = @"内存信息读取失败";
+        if (!self.safeMode) self.memLabel.text = @"内存信息读取失败";
         return;
     }
     self.memLabel.text = [NSString stringWithFormat:@"已用 %@ · 可用 %@ · 可清理约 %@",
@@ -405,21 +450,17 @@ static UIColor *RBWarn(void)   { return [UIColor colorWithRed:1.00 green:0.42 bl
     RBAppInfo *info = [self infoAtIndex:indexPath.row];
     if (!info) return nil;
 
-    UIContextualAction *kill = [UIContextualAction contextualActionWithStyle:UIContextualActionStyleDestructive
-                                                                      title:@"杀后台"
-                                                                    handler:^(UIContextualAction *action, UIView *v, void (^done)(BOOL)) {
-        if (!info.isRunning) { done(NO); return; }
-        if (![RBProcesses killApp:info.bundleID pid:info.pid]) {
-            [self toast:[NSString stringWithFormat:@"%@ 没能结束（系统拒绝）", info.name]];
-        }
-        [self reloadAfterDelay];
+    UIContextualAction *lockAct = [UIContextualAction contextualActionWithStyle:UIContextualActionStyleNormal
+                                                                     title:(info.locked ? @"取消锁定" : @"锁定保留")
+                                                                   handler:^(UIContextualAction *action, UIView *v, void (^done)(BOOL)) {
+        [self toggleLock:info];
         done(YES);
     }];
-    kill.backgroundColor = RBWarn();
+    lockAct.backgroundColor = RBLock();
 
     UIContextualAction *autoAct = [UIContextualAction contextualActionWithStyle:UIContextualActionStyleNormal
-                                                                      title:(info.hasAutoStart ? @"取消自启" : @"加入自启")
-                                                                    handler:^(UIContextualAction *action, UIView *v, void (^done)(BOOL)) {
+                                                                     title:(info.hasAutoStart ? @"取消自启" : @"加入自启")
+                                                                   handler:^(UIContextualAction *action, UIView *v, void (^done)(BOOL)) {
         RBStore *s = [RBStore shared];
         if (info.hasAutoStart) [s.autoStartIDs removeObject:info.bundleID];
         else [s.autoStartIDs addObject:info.bundleID];
@@ -429,7 +470,24 @@ static UIColor *RBWarn(void)   { return [UIColor colorWithRed:1.00 green:0.42 bl
     }];
     autoAct.backgroundColor = [UIColor colorWithWhite:0.28 alpha:1];
 
-    return [UISwipeActionsConfiguration configurationWithActions:@[kill, autoAct]];
+    UIContextualAction *kill = [UIContextualAction contextualActionWithStyle:UIContextualActionStyleDestructive
+                                                                      title:@"杀后台"
+                                                                    handler:^(UIContextualAction *action, UIView *v, void (^done)(BOOL)) {
+        if (!info.isRunning) { done(NO); return; }
+        if (info.locked) {
+            [self toast:[NSString stringWithFormat:@"%@ 已锁定，先取消锁定", info.name]];
+            done(NO);
+            return;
+        }
+        if (![RBProcesses killApp:info.bundleID pid:info.pid]) {
+            [self toast:[NSString stringWithFormat:@"%@ 没能结束（系统拒绝）", info.name]];
+        }
+        [self reloadAfterDelay];
+        done(YES);
+    }];
+    kill.backgroundColor = RBWarn();
+
+    return [UISwipeActionsConfiguration configurationWithActions:@[kill, autoAct, lockAct]];
 }
 
 - (void)tableView:(UITableView *)tableView didSelectRowAtIndexPath:(NSIndexPath *)indexPath {
@@ -442,18 +500,27 @@ static UIColor *RBWarn(void)   { return [UIColor colorWithRed:1.00 green:0.42 bl
         double mb = [RBBooster footprintMBForPid:info.pid];
         mem = mb > 0 ? [NSString stringWithFormat:@"占用 %@", RBHumanMB(mb)] : @"运行中（占用未知）";
     }
+    NSString *lockNote = info.locked ? @"已锁定 · 一键加速不会结束它" : @"未锁定 · 一键加速可能结束它";
     UIAlertController *ac = [UIAlertController
         alertControllerWithTitle:info.name
-                         message:[NSString stringWithFormat:@"%@\n%@\n%@",
-                                  info.bundleID, info.isRunning ? @"运行中" : @"未运行", mem]
+                         message:[NSString stringWithFormat:@"%@\n%@\n%@\n%@",
+                                  info.bundleID, info.isRunning ? @"运行中" : @"未运行", mem, lockNote]
                   preferredStyle:UIAlertControllerStyleActionSheet];
 
+    // 锁定放在第一个：用户最常做的决定就是「这个别动」
+    [ac addAction:[UIAlertAction actionWithTitle:(info.locked ? @"取消锁定" : @"锁定（加速时保留）")
+                                           style:UIAlertActionStyleDefault
+                                         handler:^(UIAlertAction *a) { [self toggleLock:info]; }]];
     [ac addAction:[UIAlertAction actionWithTitle:(info.hasBackstage ? @"关闭真后台" : @"开启真后台")
                                            style:UIAlertActionStyleDefault
                                          handler:^(UIAlertAction *a) { [self toggleBackstage:info]; }]];
     if (info.isRunning) {
         [ac addAction:[UIAlertAction actionWithTitle:@"杀后台" style:UIAlertActionStyleDestructive
                                              handler:^(UIAlertAction *a) {
+            if (info.locked) {
+                [self toast:@"已锁定，先取消锁定再杀"];
+                return;
+            }
             [RBProcesses killApp:info.bundleID pid:info.pid];
             [self reloadAfterDelay];
         }]];
@@ -475,6 +542,26 @@ static UIColor *RBWarn(void)   { return [UIColor colorWithRed:1.00 green:0.42 bl
 }
 
 #pragma mark 动作
+
+/// 锁定 / 解锁。锁定后这个 App 会同时被排除在「一键加速」和「退出即杀」之外，
+/// 真后台也一并关闭 —— 锁定的意思就是「别管它」，别搞两套语义互相打架。
+- (void)toggleLock:(RBAppInfo *)info {
+    RBStore *s = [RBStore shared];
+    if (info.locked) {
+        [s.lockIDs removeObject:info.bundleID];
+        [s save];
+        [self toast:[NSString stringWithFormat:@"%@ 已解锁，下次加速可能被结束", info.name]];
+    } else {
+        [s.lockIDs addObject:info.bundleID];
+        // 锁定与「退出即杀」天然冲突，锁定优先，把冲突项移除
+        if ([s.suicideIDs containsObject:info.bundleID]) {
+            [s.suicideIDs removeObject:info.bundleID];
+        }
+        [s save];
+        [self toast:[NSString stringWithFormat:@"%@ 已锁定，加速时不会动它", info.name]];
+    }
+    [self reload];
+}
 
 - (void)toggleBackstage:(RBAppInfo *)info {
     RBStore *s = [RBStore shared];
@@ -526,16 +613,46 @@ static UIColor *RBWarn(void)   { return [UIColor colorWithRed:1.00 green:0.42 bl
     self.boostButton.enabled = NO;
     [self.boostButton setTitle:@"正在统计…" forState:UIControlStateNormal];
 
-    NSSet *protect = [[RBStore shared].backstageIDs copy];
+    NSSet *protect = [[RBStore shared] allProtectedIDs];
     dispatch_async(dispatch_get_global_queue(QOS_CLASS_USER_INITIATED, 0), ^{
         NSArray *cands = [RBBooster candidatesProtecting:protect];
+        NSArray *locked = [RBBooster lockedCandidatesProtecting:protect];
         dispatch_async(dispatch_get_main_queue(), ^{
             self.boostBusy = NO;
             self.boostButton.enabled = YES;
             [self.boostButton setTitle:@"一键加速" forState:UIControlStateNormal];
 
+            // 锁定项的名字要换成 App 显示名，bundleID 对普通用户没意义
+            NSMutableDictionary<NSString *, NSString *> *nameMap = [NSMutableDictionary dictionary];
+            for (RBAppInfo *i in self.allApps) {
+                if (i.bundleID.length) nameMap[i.bundleID] = i.name ?: i.bundleID;
+            }
+
+            NSMutableString *lockLine = [NSMutableString string];
+            if (locked.count > 0) {
+                double kept = 0;
+                NSMutableArray<NSString *> *names = [NSMutableArray array];
+                for (NSDictionary *d in locked) {
+                    kept += [d[@"mb"] doubleValue];
+                    NSString *bid = d[@"bundleID"];
+                    [names addObject:nameMap[bid] ?: bid];
+                }
+                NSUInteger show = MIN(names.count, 5u);
+                [lockLine appendFormat:@"🔒 已锁定跳过 %lu 个（约 %@）：%@%@\n\n",
+                 (unsigned long)locked.count, RBHumanMB(kept),
+                 [[names subarrayWithRange:NSMakeRange(0, show)] componentsJoinedByString:@"、"],
+                 names.count > show ? @"…" : @""];
+            }
+
             if (cands.count == 0) {
-                [self toast:@"没有可清理的后台进程（真后台白名单里的、系统 App、8MB 以下的不动）"];
+                NSString *msg = lockLine.length
+                    ? [lockLine stringByAppendingString:@"除此之外没有可清理的后台进程。"]
+                    : @"没有可清理的后台进程（系统 App、8MB 以下的不动）。";
+                UIAlertController *ac = [UIAlertController alertControllerWithTitle:@"无需加速"
+                                                                           message:msg
+                                                                    preferredStyle:UIAlertControllerStyleAlert];
+                [ac addAction:[UIAlertAction actionWithTitle:@"好" style:UIAlertActionStyleDefault handler:nil]];
+                [self presentAlert:ac];
                 return;
             }
 
@@ -544,9 +661,10 @@ static UIColor *RBWarn(void)   { return [UIColor colorWithRed:1.00 green:0.42 bl
             NSUInteger shown = 0;
             for (NSDictionary *d in cands) {
                 est += [d[@"mb"] doubleValue];
-                if (shown < 8) {
+                if (shown < 6) {
+                    NSString *bid = d[@"bundleID"];
                     [list appendFormat:@"· %@ %@%@\n",
-                     d[@"bundleID"],
+                     nameMap[bid] ?: bid,
                      [d[@"estimated"] boolValue] ? @"~" : @"",
                      RBHumanMB([d[@"mb"] doubleValue])];
                     shown++;
@@ -558,7 +676,8 @@ static UIColor *RBWarn(void)   { return [UIColor colorWithRed:1.00 green:0.42 bl
 
             UIAlertController *ac = [UIAlertController
                 alertControllerWithTitle:[NSString stringWithFormat:@"将结束 %lu 个后台进程", (unsigned long)cands.count]
-                                 message:[NSString stringWithFormat:@"预计释放约 %@\n\n%@", RBHumanMB(est), list]
+                                 message:[NSString stringWithFormat:@"%@预计释放约 %@\n\n%@",
+                                          lockLine, RBHumanMB(est), list]
                           preferredStyle:UIAlertControllerStyleAlert];
             [ac addAction:[UIAlertAction actionWithTitle:@"取消" style:UIAlertActionStyleCancel handler:nil]];
             [ac addAction:[UIAlertAction actionWithTitle:@"开始加速" style:UIAlertActionStyleDestructive
@@ -573,7 +692,7 @@ static UIColor *RBWarn(void)   { return [UIColor colorWithRed:1.00 green:0.42 bl
     self.boostButton.enabled = NO;
     [self.boostButton setTitle:@"正在加速…" forState:UIControlStateNormal];
 
-    NSSet *protect = [[RBStore shared].backstageIDs copy];
+    NSSet *protect = [[RBStore shared] allProtectedIDs];
     dispatch_async(dispatch_get_global_queue(QOS_CLASS_USER_INITIATED, 0), ^{
         NSDictionary *r = [RBBooster boostProtecting:protect];
         dispatch_async(dispatch_get_main_queue(), ^{
@@ -581,10 +700,18 @@ static UIColor *RBWarn(void)   { return [UIColor colorWithRed:1.00 green:0.42 bl
             self.boostButton.enabled = YES;
             [self.boostButton setTitle:@"一键加速" forState:UIControlStateNormal];
 
-            NSString *msg = [NSString stringWithFormat:@"结束 %@ 个进程，释放 %@\n可用内存 %@ → %@\n失败 %@ 个",
-                             r[@"killed"], RBHumanMB([r[@"freedMB"] doubleValue]),
-                             RBHumanMB([r[@"beforeMB"] doubleValue]),
-                             RBHumanMB([r[@"afterMB"] doubleValue]), r[@"failed"]];
+            NSMutableString *msg = [NSMutableString stringWithFormat:
+                @"结束 %@ 个进程\n释放 %@（可用 %@ → %@）\n失败 %@ 个",
+                r[@"killed"], RBHumanMB([r[@"freedMB"] doubleValue]),
+                RBHumanMB([r[@"beforeMB"] doubleValue]),
+                RBHumanMB([r[@"afterMB"] doubleValue]), r[@"failed"]];
+
+            NSUInteger lockedSkipped = [r[@"lockedSkipped"] unsignedIntegerValue];
+            if (lockedSkipped > 0) {
+                [msg appendFormat:@"\n\n🔒 锁定保留 %lu 个（约 %@），没有被碰",
+                 (unsigned long)lockedSkipped, RBHumanMB([r[@"lockedKeptMB"] doubleValue])];
+            }
+
             UIAlertController *ac = [UIAlertController alertControllerWithTitle:@"加速完成"
                                                                        message:msg
                                                                 preferredStyle:UIAlertControllerStyleAlert];
@@ -595,6 +722,83 @@ static UIColor *RBWarn(void)   { return [UIColor colorWithRed:1.00 green:0.42 bl
     });
 }
 
+#pragma mark 菜单 / 诊断
+
+- (void)showMenu {
+    UIAlertController *ac = [UIAlertController alertControllerWithTitle:nil message:nil
+                                                        preferredStyle:UIAlertControllerStyleActionSheet];
+    [ac addAction:[UIAlertAction actionWithTitle:@"全部开启真后台" style:UIAlertActionStyleDefault
+                                         handler:^(UIAlertAction *a) { [self enableAllRunning]; }]];
+    [ac addAction:[UIAlertAction actionWithTitle:@"诊断信息 / 日志位置" style:UIAlertActionStyleDefault
+                                         handler:^(UIAlertAction *a) { [self showDiag]; }]];
+    NSString *crash = RBReadLastCrash();
+    if (crash.length) {
+        [ac addAction:[UIAlertAction actionWithTitle:@"查看上次崩溃记录" style:UIAlertActionStyleDefault
+                                             handler:^(UIAlertAction *a) {
+            self.crashPrompted = NO;
+            [self promptLastCrashIfAny];
+        }]];
+        [ac addAction:[UIAlertAction actionWithTitle:@"清除崩溃记录" style:UIAlertActionStyleDestructive
+                                             handler:^(UIAlertAction *a) {
+            RBDismissCrash();
+            self.safeMode = NO;
+            [self toast:@"已清除，重试正常加载"];
+            [self reload];
+        }]];
+    }
+    [ac addAction:[UIAlertAction actionWithTitle:@"取消" style:UIAlertActionStyleCancel handler:nil]];
+
+    ac.popoverPresentationController.barButtonItem = self.navigationItem.leftBarButtonItem;
+    [self presentAlert:ac];
+}
+
+- (void)showDiag {
+    NSString *crash = RBReadLastCrash();
+    NSString *msg = [NSString stringWithFormat:
+        @"版本 %@\n"
+        @"日志目录：\n%@\n\n"
+        @"用「文件」App → 我的 iPhone → 真后台 Pro，可以直接看到并分享：\n"
+        @"· RealBG-log.txt（运行日志）\n"
+        @"· RealBG-crash.txt（崩溃记录）\n\n"
+        @"上次崩溃：%@\n"
+        @"安全模式：%@\n"
+        @"已加载 App 数：%lu",
+        RB_VERSION,
+        RBLogDirPath(),
+        crash.length ? [NSString stringWithFormat:@"有（%lu 字符）", (unsigned long)crash.length] : @"无",
+        self.safeMode ? @"开" : @"关",
+        (unsigned long)self.allApps.count];
+
+    UIAlertController *ac = [UIAlertController alertControllerWithTitle:@"诊断信息"
+                                                               message:msg
+                                                        preferredStyle:UIAlertControllerStyleAlert];
+    [ac addAction:[UIAlertAction actionWithTitle:@"好" style:UIAlertActionStyleDefault handler:nil]];
+    [self presentAlert:ac];
+}
+
+/// 启动时如果发现上次崩过，直接把现场摊给用户看。
+/// 只弹一次，看完清楚了再从菜单里清掉。
+- (void)promptLastCrashIfAny {
+    if (self.crashPrompted) return;
+    NSString *crash = RBReadLastCrash();
+    if (crash.length == 0) return;
+    self.crashPrompted = YES;
+
+    NSString *body = crash.length > 900 ? [[crash substringToIndex:900] stringByAppendingString:@"\n…（完整内容见 RealBG-crash.txt）"] : crash;
+    UIAlertController *ac = [UIAlertController
+        alertControllerWithTitle:@"上次启动异常"
+                         message:[NSString stringWithFormat:@"已进入安全模式（不自动扫描，界面可以先打开）。\n\n%@\n\n完整记录：文件 App → 我的 iPhone → 真后台 Pro → RealBG-crash.txt", body]
+                  preferredStyle:UIAlertControllerStyleAlert];
+    [ac addAction:[UIAlertAction actionWithTitle:@"知道了" style:UIAlertActionStyleDefault handler:nil]];
+    [ac addAction:[UIAlertAction actionWithTitle:@"清除并重试" style:UIAlertActionStyleDestructive
+                                         handler:^(UIAlertAction *a) {
+        RBDismissCrash();
+        self.safeMode = NO;
+        [self reload];
+    }]];
+    [self presentAlert:ac];
+}
+
 #pragma mark 弹窗
 
 /// 已经有弹窗在显示时直接 present 会失败（控制台报 already presenting，用户什么也看不到）。
@@ -603,7 +807,7 @@ static UIColor *RBWarn(void)   { return [UIColor colorWithRed:1.00 green:0.42 bl
     UIViewController *top = self.presentedViewController;
     if (top && !top.isBeingDismissed) {
         [top dismissViewControllerAnimated:NO completion:^{
-            if (!self.presentedViewController) {
+            if (!self.presentedViewController && self.view.window) {
                 [self presentViewController:ac animated:YES completion:nil];
             }
         }];

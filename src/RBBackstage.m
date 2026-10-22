@@ -126,16 +126,23 @@ static void RBInstallHookOn(Class cls, NSString *selName, IMP imp, const char *f
     }
 }
 
-__attribute__((constructor))
-static void RBInstallSceneWindowHooks(void) {
-    Class cls = NSClassFromString(@"UIRootSceneWindow");
-    if (!cls) {
-        RBLog(@"UIRootSceneWindow 不存在，跳过层级 hook（iOS 版本差异）");
-        return;
-    }
-    RBInstallHookOn(cls, @"windowLevel", (IMP)RBHookWindowLevel, "d16@0:8");
-    RBInstallHookOn(cls, @"_canShowWhileLocked", (IMP)RBHookCanShowWhileLocked, "B16@0:8");
-    RBLog(@"scene 窗口层级 hook 已安装：%@", cls);
+/// 注意：这里原来是 __attribute__((constructor))，也就是在 main 之前就跑。
+/// 那是最危险的时机 —— 当时 UIKit 还没完成自己的 +load / 初始化，去 NSClassFromString
+/// 摸它的私有类、再 class_addMethod 改方法表，任何一点意外都是「打开即闪退」，
+/// 而且崩在 pre-main，连崩溃日志都来不及装。
+/// 改成懒加载：第一次真的要挂 scene 时才装，那时 UIKit 早就准备好了。
+static void RBInstallSceneWindowHooksIfNeeded(void) {
+    static dispatch_once_t once;
+    dispatch_once(&once, ^{
+        Class cls = NSClassFromString(@"UIRootSceneWindow");
+        if (!cls) {
+            RBLog(@"UIRootSceneWindow 不存在，跳过层级 hook（iOS 版本差异）");
+            return;
+        }
+        RBInstallHookOn(cls, @"windowLevel", (IMP)RBHookWindowLevel, "d16@0:8");
+        RBInstallHookOn(cls, @"_canShowWhileLocked", (IMP)RBHookCanShowWhileLocked, "B16@0:8");
+        RBLog(@"scene 窗口层级 hook 已安装：%@", cls);
+    });
 }
 
 #pragma mark -
@@ -221,6 +228,7 @@ static void RBInstallSceneWindowHooks(void) {
 }
 
 - (BOOL)attachSceneFor:(NSString *)bundleID {
+    RBInstallSceneWindowHooksIfNeeded();
     Class defCls = NSClassFromString(@"FBMutableSceneDefinition");
     Class idCls = NSClassFromString(@"FBSSceneIdentity");
     Class cidCls = NSClassFromString(@"FBSSceneClientIdentity");

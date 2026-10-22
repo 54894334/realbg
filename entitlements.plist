@@ -6,8 +6,13 @@
     <key>platform-application</key>
     <true/>
 
-    <!-- 读写 /var/mobile/Library/Preferences 存配置、枚举别的 App -->
+    <!-- 读写 /var/mobile 下的配置、枚举别的 App。
+         no-container 和 no-sandbox 必须成对出现：
+         只给 no-sandbox 时，libsystem_secinit 仍会去找本 App 的容器，
+         容器不存在或权限不对就直接在启动瞬间中止进程（典型表现就是点开一闪就没了）。 -->
     <key>com.apple.private.security.no-sandbox</key>
+    <true/>
+    <key>com.apple.private.security.no-container</key>
     <true/>
     <key>com.apple.private.security.storage.AppBundles</key>
     <true/>

@@ -8,6 +8,13 @@
 //  私有框架一律用 NSClassFromString 动态取类，不在链接期引用别家符号：
 //  这样 SDK 里有没有 PrivateFrameworks 的 .tbd 都能编过、都能跑。
 //
+//  1.1.0 修掉的两处会直接闪退 / 让功能整体失效的问题：
+//    · iconForPath 对 CFBundleIconFiles 的元素直接 .pathExtension —— 有的 App
+//      这一项是 NSNumber，取到就 unrecognized selector。这段还在任何 @try 之外，
+//      而 reload 在 viewDidLoad 就会在后台线程跑它 → 打开即闪退。
+//    · bundleIDForPid 截路径时少加了 marker 的长度，截出来的永远是错位路径，
+//      读不到 Info.plist，只能退化成用目录名当 bundleID → 「运行中」全部失效。
+//
 #import "RB.h"
 #import "rbproc.h"
 #import <signal.h>
@@ -94,21 +101,23 @@ static NSSet *RBProtectedExecNames(void) {
 + (NSDictionary<NSString *, NSDictionary *> *)scanBundles {
     NSMutableDictionary *out = [NSMutableDictionary dictionary];
     NSFileManager *fm = [NSFileManager defaultManager];
-    NSArray *roots = @[ @"/var/containers/Bundle/Application", @"/Applications" ];
+    NSArray<NSString *> *roots = @[ @"/var/containers/Bundle/Application", @"/Applications" ];
 
     for (NSString *root in roots) {
-        NSArray *sub = [fm contentsOfDirectoryAtPath:root error:NULL];
+        NSArray<NSString *> *sub = [fm contentsOfDirectoryAtPath:root error:NULL];
         if (sub.count == 0) continue;
         BOOL flat = [root isEqualToString:@"/Applications"];
 
-        NSMutableArray *appDirs = [NSMutableArray array];
+        NSMutableArray<NSString *> *appDirs = [NSMutableArray array];
         for (NSString *s in sub) {
+            if (![s isKindOfClass:[NSString class]]) continue;
             NSString *p = [root stringByAppendingPathComponent:s];
             if (flat) {
                 if ([p.pathExtension isEqualToString:@"app"]) [appDirs addObject:p];
             } else {
-                NSArray *inner = [fm contentsOfDirectoryAtPath:p error:NULL];
+                NSArray<NSString *> *inner = [fm contentsOfDirectoryAtPath:p error:NULL];
                 for (NSString *t in inner) {
+                    if (![t isKindOfClass:[NSString class]]) continue;
                     if ([t.pathExtension isEqualToString:@"app"]) {
                         [appDirs addObject:[p stringByAppendingPathComponent:t]];
                     }
@@ -117,89 +126,105 @@ static NSSet *RBProtectedExecNames(void) {
         }
 
         for (NSString *dir in appDirs) {
-            NSDictionary *info = [NSDictionary dictionaryWithContentsOfFile:
-                                  [dir stringByAppendingPathComponent:@"Info.plist"]];
-            if (![info isKindOfClass:[NSDictionary class]]) continue;
-            NSString *bid = info[@"CFBundleIdentifier"];
-            if (![bid isKindOfClass:[NSString class]] || bid.length == 0) continue;
-            NSString *name = info[@"CFBundleDisplayName"] ?: info[@"CFBundleName"] ?: bid;
-            out[bid] = @{ @"path": dir, @"name": name };
+            @autoreleasepool {
+                NSDictionary *info = [NSDictionary dictionaryWithContentsOfFile:
+                                      [dir stringByAppendingPathComponent:@"Info.plist"]];
+                if (![info isKindOfClass:[NSDictionary class]]) continue;
+                id bidRaw = info[@"CFBundleIdentifier"];
+                if (![bidRaw isKindOfClass:[NSString class]] || [(NSString *)bidRaw length] == 0) continue;
+                NSString *bid = bidRaw;
+                id disp = info[@"CFBundleDisplayName"];
+                id nm = info[@"CFBundleName"];
+                NSString *name = [disp isKindOfClass:[NSString class]] ? disp
+                               : ([nm isKindOfClass:[NSString class]] ? nm : bid);
+                out[bid] = @{ @"path": dir, @"name": name };
+            }
         }
     }
     return out;
 }
 
 + (NSArray<RBAppInfo *> *)installedApps {
-    NSMutableDictionary<NSString *, NSString *> *names = [NSMutableDictionary dictionary];
-    NSMutableDictionary<NSString *, NSString *> *paths = [NSMutableDictionary dictionary];
+    @try {
+        NSMutableDictionary<NSString *, NSString *> *names = [NSMutableDictionary dictionary];
+        NSMutableDictionary<NSString *, NSString *> *paths = [NSMutableDictionary dictionary];
 
-    // ① LSApplicationWorkspace（有就用，能给本地化名字和真实路径）
-    Class wsCls = NSClassFromString(@"LSApplicationWorkspace");
-    if (wsCls) {
-        @try {
-            id ws = ((id (*)(id, SEL))objc_msgSend)(wsCls, @selector(defaultWorkspace));
-            NSArray *apps = nil;
-            SEL sAll = NSSelectorFromString(@"allInstalledApplications");
-            SEL sIns = NSSelectorFromString(@"installedApplications");
-            if ([ws respondsToSelector:sAll]) {
-                apps = ((id (*)(id, SEL))objc_msgSend)(ws, sAll);
-            } else if ([ws respondsToSelector:sIns]) {
-                apps = ((id (*)(id, SEL))objc_msgSend)(ws, sIns);
+        // ① LSApplicationWorkspace（有就用，能给本地化名字和真实路径）
+        Class wsCls = NSClassFromString(@"LSApplicationWorkspace");
+        if (wsCls) {
+            @try {
+                SEL sDefault = NSSelectorFromString(@"defaultWorkspace");
+                if ([wsCls respondsToSelector:sDefault]) {
+                    id ws = ((id (*)(id, SEL))objc_msgSend)(wsCls, sDefault);
+                    NSArray *apps = nil;
+                    SEL sAll = NSSelectorFromString(@"allInstalledApplications");
+                    SEL sIns = NSSelectorFromString(@"installedApplications");
+                    if ([ws respondsToSelector:sAll]) {
+                        apps = ((id (*)(id, SEL))objc_msgSend)(ws, sAll);
+                    } else if ([ws respondsToSelector:sIns]) {
+                        apps = ((id (*)(id, SEL))objc_msgSend)(ws, sIns);
+                    }
+                    if ([apps isKindOfClass:[NSArray class]]) {
+                        for (id p in apps) {
+                            @autoreleasepool {
+                                @try {
+                                    id bidRaw = [p valueForKey:@"bundleIdentifier"];
+                                    if (![bidRaw isKindOfClass:[NSString class]] || [bidRaw length] == 0) continue;
+                                    NSString *bid = bidRaw;
+                                    id name = [p valueForKey:@"localizedName"];
+                                    if ([name isKindOfClass:[NSString class]] && [name length]) names[bid] = name;
+                                    id url = [p valueForKey:@"bundleURL"];
+                                    if ([url isKindOfClass:[NSURL class]]) paths[bid] = [(NSURL *)url path];
+                                } @catch (NSException *e) {
+                                    // 单个应用取值失败就跳过，不影响整体
+                                }
+                            }
+                        }
+                    }
+                }
+            } @catch (NSException *e) {
+                RBLog(@"LSApplicationWorkspace 不可用：%@", e.reason);
             }
-            for (id p in apps) {
+        }
+
+        // ② 目录扫描兜底（LS 不可用，或某些 TrollStore 应用 LS 不收录）
+        NSUInteger lsCount = paths.count;
+        if (paths.count < 5) {
+            NSDictionary *scan = [self scanBundles];
+            for (NSString *bid in scan) {
+                if (!paths[bid]) paths[bid] = scan[bid][@"path"];
+                if (!names[bid]) names[bid] = scan[bid][@"name"];
+            }
+            RBLog(@"目录扫描：%lu 个应用（LS 只给了 %lu 个）",
+                  (unsigned long)scan.count, (unsigned long)lsCount);
+        }
+
+        NSMutableArray<RBAppInfo *> *out = [NSMutableArray array];
+
+        for (NSString *bid in paths) {
+            @autoreleasepool {
+                RBAppInfo *info = [RBAppInfo new];
+                info.bundleID = bid;
+                info.name = names[bid] ?: bid;
+                info.isSystem = [bid hasPrefix:@"com.apple."];
                 @try {
-                    NSString *bid = [p valueForKey:@"bundleIdentifier"];
-                    if (![bid isKindOfClass:[NSString class]] || bid.length == 0) continue;
-                    NSString *name = [p valueForKey:@"localizedName"];
-                    if ([name isKindOfClass:[NSString class]] && name.length) names[bid] = name;
-                    id url = [p valueForKey:@"bundleURL"];
-                    if ([url isKindOfClass:[NSURL class]]) paths[bid] = [url path];
-                } @catch (NSException *e) {}
+                    info.icon = [self iconForPath:paths[bid] bundleID:bid];
+                } @catch (NSException *e) {
+                    info.icon = nil;      // 图标拿不到就用占位图，不能让整页崩掉
+                }
+                [out addObject:info];
             }
-        } @catch (NSException *e) {
-            RBLog(@"LSApplicationWorkspace 不可用：%@", e.reason);
         }
-    }
 
-    // ② 目录扫描兜底（LS 不可用，或某些 TrollStore 应用 LS 不收录）
-    NSUInteger lsCount = paths.count;
-    if (paths.count < 5) {
-        NSDictionary *scan = [self scanBundles];
-        for (NSString *bid in scan) {
-            if (!paths[bid]) paths[bid] = scan[bid][@"path"];
-            if (!names[bid]) names[bid] = scan[bid][@"name"];
-        }
-        RBLog(@"目录扫描：%lu 个应用（LS 只给了 %lu 个）",
-              (unsigned long)scan.count, (unsigned long)lsCount);
+        [out sortUsingComparator:^NSComparisonResult(RBAppInfo *a, RBAppInfo *b) {
+            if (a.isSystem != b.isSystem) return a.isSystem ? NSOrderedDescending : NSOrderedAscending;
+            return [a.name localizedCaseInsensitiveCompare:b.name];
+        }];
+        return out;
+    } @catch (NSException *e) {
+        RBLog(@"installedApps 异常：%@ %@", e.name, e.reason);
+        return @[];
     }
-
-    NSMutableArray *out = [NSMutableArray array];
-    for (NSString *bid in names) {
-        if (paths[bid] == nil) continue;
-        RBAppInfo *info = [RBAppInfo new];
-        info.bundleID = bid;
-        info.name = names[bid] ?: bid;
-        info.isSystem = [bid hasPrefix:@"com.apple."];
-        info.icon = [self iconForPath:paths[bid] bundleID:bid];
-        [out addObject:info];
-    }
-
-    // 只给了路径没给名字的（LS 没收录的 TrollStore 应用）
-    for (NSString *bid in paths) {
-        if (names[bid]) continue;
-        RBAppInfo *info = [RBAppInfo new];
-        info.bundleID = bid;
-        info.name = [paths[bid] lastPathComponent].stringByDeletingPathExtension ?: bid;
-        info.isSystem = [bid hasPrefix:@"com.apple."];
-        info.icon = [self iconForPath:paths[bid] bundleID:bid];
-        [out addObject:info];
-    }
-
-    [out sortUsingComparator:^NSComparisonResult(RBAppInfo *a, RBAppInfo *b) {
-        if (a.isSystem != b.isSystem) return a.isSystem ? NSOrderedDescending : NSOrderedAscending;
-        return [a.name localizedCaseInsensitiveCompare:b.name];
-    }];
-    return out;
 }
 
 /// 从 App 目录里读图标（只用 Info.plist + 文件，不碰任何私有 API）
@@ -209,60 +234,82 @@ static NSSet *RBProtectedExecNames(void) {
     dispatch_once(&once, ^{ cache = [NSMutableDictionary dictionary]; });
 
     if (bid.length == 0 || path.length == 0) return nil;
-    id hit = cache[bid];
-    if (hit) return hit == [NSNull null] ? nil : hit;
+
+    @synchronized([RBProcesses class]) {
+        id hit = cache[bid];
+        if (hit) return hit == [NSNull null] ? nil : hit;
+    }
 
     UIImage *img = nil;
-    NSDictionary *info = [NSDictionary dictionaryWithContentsOfFile:
-                          [path stringByAppendingPathComponent:@"Info.plist"]];
+    @try {
+        NSDictionary *info = [NSDictionary dictionaryWithContentsOfFile:
+                              [path stringByAppendingPathComponent:@"Info.plist"]];
 
-    NSMutableArray *names = [NSMutableArray array];
-    id icons = info[@"CFBundleIcons"];
-    if ([icons isKindOfClass:[NSDictionary class]]) {
-        id primary = icons[@"CFBundlePrimaryIcon"];
-        if ([primary isKindOfClass:[NSDictionary class]]) {
-            id files = primary[@"CFBundleIconFiles"];
-            if ([files isKindOfClass:[NSArray class]]) [names addObjectsFromArray:files];
-        }
-        id files = icons[@"CFBundleIconFiles"];
-        if ([files isKindOfClass:[NSArray class]]) [names addObjectsFromArray:files];
-    }
-    id legacy = info[@"CFBundleIconFiles"];
-    if ([legacy isKindOfClass:[NSArray class]]) [names addObjectsFromArray:legacy];
-    id single = info[@"CFBundleIconFile"];
-    if ([single isKindOfClass:[NSString class]]) [names addObject:single];
-
-    NSArray *suffixes = @[ @"@3x", @"@2x", @"" ];
-    for (NSString *n in names) {
-        NSString *base = n.pathExtension.length ? n.stringByDeletingPathExtension : n;
-        for (NSString *sfx in suffixes) {
-            NSString *file = [NSString stringWithFormat:@"%@%@.png", base, sfx];
-            NSString *full = [path stringByAppendingPathComponent:file];
-            if ([[NSFileManager defaultManager] fileExistsAtPath:full]) {
-                img = [UIImage imageWithContentsOfFile:full];
-                if (img) break;
+        NSMutableArray<NSString *> *names = [NSMutableArray array];
+        // CFBundleIconFiles 里偶尔混着 NSNumber / NSNull，统一在这里过滤掉。
+        // 直接对非字符串发 .pathExtension 就是 unrecognized selector 崩溃。
+        void (^collect)(id) = ^(id v) {
+            if (![v isKindOfClass:[NSArray class]]) return;
+            for (id x in (NSArray *)v) {
+                if ([x isKindOfClass:[NSString class]] && [(NSString *)x length] > 0) {
+                    [names addObject:(NSString *)x];
+                }
             }
+        };
+
+        id icons = info[@"CFBundleIcons"];
+        if ([icons isKindOfClass:[NSDictionary class]]) {
+            id primary = ((NSDictionary *)icons)[@"CFBundlePrimaryIcon"];
+            if ([primary isKindOfClass:[NSDictionary class]]) {
+                collect(((NSDictionary *)primary)[@"CFBundleIconFiles"]);
+            }
+            collect(((NSDictionary *)icons)[@"CFBundleIconFiles"]);
         }
-        if (img) break;
+        collect(info[@"CFBundleIconFiles"]);
+        id single = info[@"CFBundleIconFile"];
+        if ([single isKindOfClass:[NSString class]] && [(NSString *)single length]) {
+            [names addObject:(NSString *)single];
+        }
+
+        NSArray<NSString *> *suffixes = @[ @"@3x", @"@2x", @"" ];
+        for (NSString *n in names) {
+            NSString *base = n.pathExtension.length ? [n stringByDeletingPathExtension] : n;
+            if (base.length == 0) continue;
+            for (NSString *sfx in suffixes) {
+                NSString *file = [NSString stringWithFormat:@"%@%@.png", base, sfx];
+                NSString *full = [path stringByAppendingPathComponent:file];
+                if ([[NSFileManager defaultManager] fileExistsAtPath:full]) {
+                    img = [UIImage imageWithContentsOfFile:full];
+                    if (img) break;
+                }
+            }
+            if (img) break;
+        }
+
+        // 都没命中：扫一遍目录里最大的那个 png 当图标
+        if (!img) {
+            NSArray<NSString *> *files = [[NSFileManager defaultManager] contentsOfDirectoryAtPath:path error:NULL];
+            NSString *best = nil;
+            unsigned long long bestSize = 0;
+            for (NSString *f in files) {
+                if (![f isKindOfClass:[NSString class]]) continue;
+                if (![[f.pathExtension lowercaseString] isEqualToString:@"png"]) continue;
+                if (![f hasPrefix:@"AppIcon"] && ![f hasPrefix:@"Icon"]) continue;
+                NSDictionary *attr = [[NSFileManager defaultManager] attributesOfItemAtPath:
+                                      [path stringByAppendingPathComponent:f] error:NULL];
+                unsigned long long sz = [attr[NSFileSize] unsignedLongLongValue];
+                if (sz > bestSize) { bestSize = sz; best = f; }
+            }
+            if (best) img = [UIImage imageWithContentsOfFile:[path stringByAppendingPathComponent:best]];
+        }
+    } @catch (NSException *e) {
+        RBLog(@"图标读取异常（%@）：%@", bid, e.reason);
+        img = nil;
     }
 
-    // 都没命中：扫一遍目录里最大的那个 png 当图标
-    if (!img) {
-        NSArray *files = [[NSFileManager defaultManager] contentsOfDirectoryAtPath:path error:NULL];
-        NSString *best = nil;
-        unsigned long long bestSize = 0;
-        for (NSString *f in files) {
-            if (![[f.pathExtension lowercaseString] isEqualToString:@"png"]) continue;
-            if (![f hasPrefix:@"AppIcon"] && ![f hasPrefix:@"Icon"]) continue;
-            NSDictionary *attr = [[NSFileManager defaultManager] attributesOfItemAtPath:
-                                  [path stringByAppendingPathComponent:f] error:NULL];
-            unsigned long long sz = [attr[NSFileSize] unsignedLongLongValue];
-            if (sz > bestSize) { bestSize = sz; best = f; }
-        }
-        if (best) img = [UIImage imageWithContentsOfFile:[path stringByAppendingPathComponent:best]];
+    @synchronized([RBProcesses class]) {
+        cache[bid] = img ?: [NSNull null];
     }
-
-    cache[bid] = img ?: [NSNull null];
     return img;
 }
 
@@ -278,23 +325,37 @@ static NSSet *RBProtectedExecNames(void) {
 
     NSString *exe = [NSString stringWithUTF8String:path];
     if (exe.length == 0) return nil;                      // 非 UTF8 路径
-    NSRange r = [exe rangeOfString:@"/Bundle/Application/"];
+
+    static NSString *const kMarker = @"/Bundle/Application/";
+    NSRange r = [exe rangeOfString:kMarker];
     if (r.location == NSNotFound) return nil;
 
-    NSString *tail = [exe substringFromIndex:r.location + r.length];
-    NSArray *parts = [tail componentsSeparatedByString:@"/"];
+    NSUInteger afterMarker = r.location + r.length;
+    if (afterMarker >= exe.length) return nil;
+
+    // tail = "<UUID>/<Name>.app/<可执行文件>"
+    NSString *tail = [exe substringFromIndex:afterMarker];
+    NSArray<NSString *> *parts = [tail componentsSeparatedByString:@"/"];
     if (parts.count < 2) return nil;
 
-    // 从完整路径截出 .../<UUID>/<Name>.app，不硬编码 /private/var 前缀
-    NSRange r2 = [tail rangeOfString:parts[1]];
-    if (r2.location == NSNotFound) return nil;
-    NSString *bundlePath = [exe substringToIndex:r.location + r2.location + r2.length];
+    NSString *uuidDir = parts[0];
+    NSString *appDir  = parts[1];
+    if (uuidDir.length == 0 || appDir.length == 0) return nil;
 
+    // 拼接而不是算索引：索引算术一旦少加一段，截出来的路径就是错位的
+    // （1.0.x 就是这样：读不到 Info.plist，全部退化成目录名）。
+    NSString *bundlePath = [NSString stringWithFormat:@"%@%@/%@",
+                            [exe substringToIndex:afterMarker], uuidDir, appDir];
+
+    NSString *bid = nil;
     NSDictionary *info = [NSDictionary dictionaryWithContentsOfFile:
                           [bundlePath stringByAppendingPathComponent:@"Info.plist"]];
-    NSString *bid = [info isKindOfClass:[NSDictionary class]] ? info[@"CFBundleIdentifier"] : nil;
-    if (![bid isKindOfClass:[NSString class]] || bid.length == 0) {
-        bid = [(NSString *)parts[1] stringByDeletingPathExtension];
+    if ([info isKindOfClass:[NSDictionary class]]) {
+        id v = info[@"CFBundleIdentifier"];
+        if ([v isKindOfClass:[NSString class]] && [(NSString *)v length] > 0) bid = v;
+    }
+    if (bid.length == 0) {
+        bid = [appDir stringByDeletingPathExtension];
     }
     return bid.length ? bid : nil;
 }
@@ -304,17 +365,21 @@ static NSSet *RBProtectedExecNames(void) {
 
     int n = proc_listpids(PROC_ALL_PIDS, 0, NULL, 0);
     if (n <= 0) return map;
-    pid_t *pids = calloc((size_t)n + 64, sizeof(pid_t));
+    int cap = n / (int)sizeof(pid_t) + 64;
+    pid_t *pids = calloc((size_t)cap, sizeof(pid_t));
     if (!pids) return map;
-    n = proc_listpids(PROC_ALL_PIDS, 0, pids, (n + 64) * (int)sizeof(pid_t));
+    n = proc_listpids(PROC_ALL_PIDS, 0, pids, cap * (int)sizeof(pid_t));
     if (n <= 0) { free(pids); return map; }
     int count = n / (int)sizeof(pid_t);
+    if (count > cap) count = cap;
 
     for (int i = 0; i < count; i++) {
-        pid_t pid = pids[i];
-        if (pid <= 0) continue;
-        NSString *bid = [self bundleIDForPid:pid];
-        if (bid.length) map[bid] = @(pid);
+        @autoreleasepool {
+            pid_t pid = pids[i];
+            if (pid <= 0) continue;
+            NSString *bid = [self bundleIDForPid:pid];
+            if (bid.length && !map[bid]) map[bid] = @(pid);
+        }
     }
     free(pids);
     return map;
@@ -366,8 +431,11 @@ static BOOL RBKillViaRunningBoard(pid_t pid) {
 
 + (BOOL)killApp:(NSString *)bundleID pid:(pid_t)pid {
     if (pid <= 1) return NO;
+    if (pid == getpid()) return NO;
     if (RBIsSystemBundle(bundleID)) return NO;                  // com.apple.* 一律不动
     if (bundleID.length && [RBProtectedBundleIDs() containsObject:bundleID]) return NO;
+    // 保留名单在这里也必须过一遍：万一调用方漏传，也不能杀掉锁住的 App
+    if (bundleID.length && [[RBStore shared].lockIDs containsObject:bundleID]) return NO;
 
     // pid 复用防护：枚举到执行之间进程可能已经退出、pid 被别的进程占用，
     // 这种情况直接放弃，宁可少杀一个也不误杀。

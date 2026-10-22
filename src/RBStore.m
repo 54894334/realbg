@@ -4,6 +4,12 @@
 //  原包的 bug：配置路径写死成 com.thefool.app.plist（不是自己的 bundle id），
 //  所以两个不同的工具会互相覆盖配置。这里改回自己的 bundle id。
 //
+//  四份名单：
+//    WhiteList   真后台（开着的 App 会被保活）
+//    AutoStart   自启（下次开本 App 时自动恢复真后台）
+//    SuicideList 退出即杀（本 App 退到后台时结束）
+//    LockList    保留名单（加速/清理永不碰）—— 与其它三项冲突时，锁定优先
+//
 #import "RB.h"
 
 static NSString *RBPrefsPath(void) {
@@ -26,7 +32,8 @@ static NSString *RBPrefsPath(void) {
     if ((self = [super init])) {
         _backstageIDs = [NSMutableSet set];
         _autoStartIDs = [NSMutableSet set];
-        _suicideIDs = [NSMutableSet set];
+        _suicideIDs   = [NSMutableSet set];
+        _lockIDs      = [NSMutableSet set];
     }
     return self;
 }
@@ -57,6 +64,7 @@ static NSSet *RBSanitizeSet(id raw) {
     self.backstageIDs  = [RBSanitizeSet(d[@"WhiteList"]) mutableCopy];
     self.autoStartIDs  = [RBSanitizeSet(d[@"AutoStart"]) mutableCopy];
     self.suicideIDs    = [RBSanitizeSet(d[@"SuicideList"]) mutableCopy];
+    self.lockIDs       = [RBSanitizeSet(d[@"LockList"]) mutableCopy];
     self.boostOnLaunch = [d[@"BoostOnLaunch"] boolValue];
 }
 
@@ -65,6 +73,7 @@ static NSSet *RBSanitizeSet(id raw) {
         @"WhiteList":    self.backstageIDs.allObjects ?: @[],
         @"AutoStart":    self.autoStartIDs.allObjects ?: @[],
         @"SuicideList":  self.suicideIDs.allObjects ?: @[],
+        @"LockList":     self.lockIDs.allObjects ?: @[],
         @"BoostOnLaunch": @(self.boostOnLaunch),
         @"Version":      RB_VERSION,
     };
@@ -76,19 +85,13 @@ static NSSet *RBSanitizeSet(id raw) {
     }
 }
 
+/// 真后台名单 + 保留名单合并。加速与退出清理都拿这一份，避免两处各写一遍、
+/// 以后改一处漏一处。
+- (NSSet *)allProtectedIDs {
+    NSMutableSet *s = [NSMutableSet setWithSet:self.backstageIDs ?: [NSSet set]];
+    [s unionSet:self.lockIDs ?: [NSSet set]];
+    [s addObject:RB_BUNDLE];
+    return s;
+}
+
 @end
-
-#pragma mark - 工具
-
-void RBLog(NSString *fmt, ...) {
-    va_list ap;
-    va_start(ap, fmt);
-    NSString *s = [[NSString alloc] initWithFormat:fmt arguments:ap];
-    va_end(ap);
-    NSLog(@"[RealBG] %@", s);
-}
-
-NSString *RBHumanMB(double mb) {
-    if (mb >= 1024) return [NSString stringWithFormat:@"%.1f GB", mb / 1024.0];
-    return [NSString stringWithFormat:@"%.0f MB", mb];
-}
