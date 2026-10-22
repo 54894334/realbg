@@ -201,7 +201,8 @@ static void RBInstallSceneWindowHooksIfNeeded(void) {
 /// 已记录的目标进程如果已经退出（用户手动杀了 / 系统回收了），旧 scene 就是死的，
 /// 必须先清掉再重新挂，否则 isEnabled 会一直返回 YES 但实际没保护。
 - (void)dropIfStale:(NSString *)bundleID {
-    NSNumber *p = self.pids[bundleID];
+    NSNumber *p = nil;
+    @synchronized (self) { p = self.pids[bundleID]; }
     if (!p) return;
     if (RBIsAlive((pid_t)p.intValue)) return;
     RBLog(@"目标进程已退出，清理旧记录：%@", bundleID);
@@ -211,13 +212,16 @@ static void RBInstallSceneWindowHooksIfNeeded(void) {
 - (BOOL)enableForBundle:(NSString *)bundleID pid:(pid_t)pid error:(NSError **)error {
     if (bundleID.length == 0) return NO;
     [self dropIfStale:bundleID];
-    if (self.scenes[bundleID] || self.assertions[bundleID]) return YES;
+    @synchronized (self) {
+        if (self.scenes[bundleID] || self.assertions[bundleID]) return YES;
+    }
 
     BOOL ok = [self attachSceneFor:bundleID];
     if (!ok) ok = [self acquireAssertionFor:bundleID pid:pid];
 
     if (ok) {
-        self.pids[bundleID] = @(pid > 0 ? pid : [[RBProcesses runningPids][bundleID] intValue]);
+        pid_t real = pid > 0 ? pid : [[RBProcesses runningPids][bundleID] intValue];
+        @synchronized (self) { self.pids[bundleID] = @(real); }
         return YES;
     }
     if (error) {
@@ -291,7 +295,7 @@ static void RBInstallSceneWindowHooksIfNeeded(void) {
         }
         ((void (*)(id, SEL, id))objc_msgSend)(binder, NSSelectorFromString(@"addScene:"), scene);
 
-        self.scenes[bundleID] = scene;
+        @synchronized (self) { self.scenes[bundleID] = scene; }
         RBLog(@"真后台(scene) 已挂载：%@", bundleID);
         return YES;
     } @catch (NSException *e) {
@@ -339,7 +343,7 @@ static void RBInstallSceneWindowHooksIfNeeded(void) {
         BOOL ok = ((BOOL (*)(id, SEL, NSError **))objc_msgSend)(
             assertion, NSSelectorFromString(@"acquireWithError:"), &err);
         if (ok) {
-            self.assertions[bundleID] = assertion;
+            @synchronized (self) { self.assertions[bundleID] = assertion; }
             RBLog(@"真后台(assertion) 已保活：%@", bundleID);
         } else {
             RBLog(@"assertion 获取失败：%@", err.localizedDescription);
@@ -352,7 +356,14 @@ static void RBInstallSceneWindowHooksIfNeeded(void) {
 }
 
 - (void)disableForBundle:(NSString *)bundleID {
-    id scene = self.scenes[bundleID];
+    if (bundleID.length == 0) return;
+
+    id scene = nil, assertion = nil;
+    @synchronized (self) {
+        scene = self.scenes[bundleID];
+        assertion = self.assertions[bundleID];
+    }
+
     if (scene) {
         id binder = self.binder;
         if (binder && [binder respondsToSelector:NSSelectorFromString(@"removeScene:")]) {
@@ -361,25 +372,49 @@ static void RBInstallSceneWindowHooksIfNeeded(void) {
             } @catch (NSException *e) {}
         }
         [self destroyScene:scene];
-        [self.scenes removeObjectForKey:bundleID];
+        @synchronized (self) { [self.scenes removeObjectForKey:bundleID]; }
     }
-    id assertion = self.assertions[bundleID];
     if (assertion) {
         @try { ((void (*)(id, SEL))objc_msgSend)(assertion, NSSelectorFromString(@"invalidate")); }
         @catch (NSException *e) {}
-        [self.assertions removeObjectForKey:bundleID];
+        @synchronized (self) { [self.assertions removeObjectForKey:bundleID]; }
     }
-    [self.pids removeObjectForKey:bundleID];
+    @synchronized (self) { [self.pids removeObjectForKey:bundleID]; }
 }
 
 - (BOOL)isEnabledForBundle:(NSString *)bundleID {
     [self dropIfStale:bundleID];
-    return self.scenes[bundleID] != nil || self.assertions[bundleID] != nil;
+    return [self levelForBundle:bundleID] > 0;
+}
+
+/// 2 = 场景，1 = 仅断言，0 = 没挂上。
+/// 这两者不是一回事：断言只向 RunningBoard 声明「别回收这个进程」，
+/// 系统照样能把它挂起；场景是让 FrontBoard 认为它在前台渲染，才真的不停顿。
+/// 界面如果只显示「真后台」，降级成断言时就等于在骗用户。
+- (NSInteger)levelForBundle:(NSString *)bundleID {
+    if (bundleID.length == 0) return 0;
+    @synchronized (self) {
+        if (self.scenes[bundleID]) return 2;
+        if (self.assertions[bundleID]) return 1;
+        return 0;
+    }
+}
+
+- (NSDictionary<NSString *, NSNumber *> *)levelSnapshot {
+    NSMutableDictionary *d = [NSMutableDictionary dictionary];
+    @synchronized (self) {
+        for (NSString *bid in self.assertions) d[bid] = @(1);
+        for (NSString *bid in self.scenes) d[bid] = @(2);
+    }
+    return d;
 }
 
 - (NSArray<NSString *> *)enabledBundles {
-    NSMutableSet *s = [NSMutableSet setWithArray:self.scenes.allKeys];
-    [s addObjectsFromArray:self.assertions.allKeys];
+    NSMutableSet *s = [NSMutableSet set];
+    @synchronized (self) {
+        [s addObjectsFromArray:self.scenes.allKeys];
+        [s addObjectsFromArray:self.assertions.allKeys];
+    }
     return s.allObjects;
 }
 

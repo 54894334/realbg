@@ -507,6 +507,47 @@ check("+ (BOOL)launchApp:(NSString *)bundleID {" in pr_c3, "进程层提供 laun
 check("if (RBIsSystemBundle(bundleID)) return NO;" in pr_c3, "不代为启动系统 App")
 check("updateHintForTab" in vc_c, "分段切换时把「保活 / 自启」的区别直接写在界面底部")
 
+print("\n== 16. 1.4.1：真后台 ≠ 保活（界面不再把降级说成生效） ==")
+# 现场问题：勾了真后台的 App，列表里一律显示「真后台」。
+# 但真后台有两条实现路径：
+#   · FrontBoard 场景 —— 让系统认为它在渲染，真正不被挂起
+#   · RunningBoard 断言 —— 只声明「别回收」，系统仍可把它挂起
+# 界面分不出来，等于把降级当成功报给用户。
+bs = root_src["RBBackstage.m"]
+check("if (self.scenes[bundleID]) return 2;" in bs, "levelForBundle: 拿到场景返回 2")
+check("if (self.assertions[bundleID]) return 1;" in bs, "levelForBundle: 只有断言返回 1")
+check("- (NSInteger)levelForBundle:" in bs, "对外暴露实际保护等级")
+check("- (NSDictionary<NSString *, NSNumber *> *)levelSnapshot" in bs,
+      "提供等级快照给后台枚举线程")
+check("return [self levelForBundle:bundleID] > 0;" in bs,
+      "isEnabledForBundle: 统一走等级判定（原来两处各写一遍）")
+check(bs.count("@synchronized (self)") >= 6,
+      "场景/断言/pid 三本字典读写全部加锁", "（%d 处）" % bs.count("@synchronized (self)"))
+
+h_c = root_src["RB.h"]
+check("NSInteger backstageLevel;" in h_c, "RBAppInfo 增加 backstageLevel 字段")
+
+check('if (info.backstageLevel == 2)      [tags addObject:@"真后台"];' in vc_c, "场景 → 真后台")
+check('else if (info.backstageLevel == 1) [tags addObject:@"仅保活"];' in vc_c, "仅断言 → 仅保活")
+check('else                               [tags addObject:@"待挂载"];' in vc_c, "没挂上 → 待挂载")
+check("i.backstageLevel = levels[i.bundleID].integerValue;" in vc_c,
+      "reload 用主线程快照填等级（不在后台线程直接读字典）")
+check("NSDictionary<NSString *, NSNumber *> *levels = [[RBBackstage shared] levelSnapshot];" in vc_c,
+      "快照在 dispatch_async 之前取（此时还在主线程）")
+check("仅保活：进程不会被回收，但仍可能被挂起" in vc_c, "单个开启时如实区分场景与断言")
+check("个只拿到保活断言" in vc_c, "批量开启时分开报场景数与断言数")
+
+
+def _label(has_bs, level):
+    if not has_bs:
+        return None
+    return {2: "真后台", 1: "仅保活", 0: "待挂载"}[level]
+
+
+_cases = [(True, 2, "真后台"), (True, 1, "仅保活"), (True, 0, "待挂载"), (False, 0, None)]
+_bad = [(h, l, e, _label(h, l)) for h, l, e in _cases if _label(h, l) != e]
+check(not _bad, "三态映射正确（配置 × 实际等级 → 标签）", "→ %s" % (_bad or "ok"))
+
 print("\n" + "=" * 56)
 print("通过 %d 项，失败 %d 项" % (len(passed), len(failed)))
 if failed:

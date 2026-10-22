@@ -14,7 +14,7 @@
 #import <UIKit/UIKit.h>
 #import <Foundation/Foundation.h>
 
-#define RB_VERSION @"1.4.0"
+#define RB_VERSION @"1.4.1"
 #define RB_BUNDLE @"cn.bswbw.RealBG"
 
 // 配置：/var/mobile/Library/Preferences/cn.bswbw.RealBG.plist
@@ -30,7 +30,11 @@
 @property (nonatomic, assign) BOOL      isSystem;
 @property (nonatomic, assign) BOOL      isRunning;
 @property (nonatomic, assign) pid_t     pid;
-@property (nonatomic, assign) BOOL      hasBackstage;   // 已开真后台
+@property (nonatomic, assign) BOOL      hasBackstage;   // 配置里开了真后台
+/// 运行时实际拿到的保护等级，0 无 / 1 仅 RunningBoard 断言 / 2 FrontBoard 场景。
+/// 光看 hasBackstage 分不出来：「配置开了」不等于「真的挂上了」，更不等于
+/// 「挂的是场景」。1.4.1 起列表按这个值区分「真后台」和「仅保活」。
+@property (nonatomic, assign) NSInteger backstageLevel;
 @property (nonatomic, assign) BOOL      hasAutoStart;   // 已加自启
 @property (nonatomic, assign) BOOL      hasSuicide;     // 退出本 App 时结束
 @property (nonatomic, assign) BOOL      locked;         // 已锁定：加速永不清理
@@ -101,6 +105,12 @@
 - (void)disableForBundle:(NSString *)bundleID;
 - (BOOL)isEnabledForBundle:(NSString *)bundleID;
 - (NSArray<NSString *> *)enabledBundles;
+/// 实际保护等级：2 = 场景（真正不被挂起），1 = 仅断言（进程保住但仍可能被挂起），0 = 没挂上。
+/// 界面必须按这个值区分显示，否则「断言降级」会被当成「真后台生效」。
+- (NSInteger)levelForBundle:(NSString *)bundleID;
+/// 全部等级快照（bid -> @(level)）。只在主线程调用，用于喂给后台的枚举线程，
+/// 避免后台线程直接读字典产生竞态。
+- (NSDictionary<NSString *, NSNumber *> *)levelSnapshot;
 /// 一键加速用：把「我们挂上去的」保活全撤掉。只 kill 进程而不撤保活，
 /// SpringBoard 会立刻把 App 拉回来，表现就是「加速完了它还在运行」。
 /// 注意：默认保护的名单里本来就含真后台 App，这里只是兜底清理。

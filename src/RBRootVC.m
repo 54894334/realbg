@@ -115,7 +115,16 @@ static UIColor *RBLock(void)   { return [UIColor colorWithRed:1.00 green:0.78 bl
     // 标签最多显示两个，其余折成「+N」—— 四个标签挤在一行会互相顶掉
     NSMutableArray<NSString *> *tags = [NSMutableArray array];
     if (info.locked)       [tags addObject:@"已锁定"];
-    if (info.hasBackstage) [tags addObject:@"真后台"];
+    // 真后台要分三态。配置里勾了不等于运行时挂上了，挂上断言也不等于拿到了场景：
+    //   · 场景   → 真正不被挂起，显示「真后台」
+    //   · 仅断言 → 进程保住但系统仍可能挂起它，显示「仅保活」
+    //   · 都没挂 → 多半是 App 没在运行，显示「待挂载」
+    // 原来三种情况都写「真后台」，等于把降级说成生效。
+    if (info.hasBackstage) {
+        if (info.backstageLevel == 2)      [tags addObject:@"真后台"];
+        else if (info.backstageLevel == 1) [tags addObject:@"仅保活"];
+        else                               [tags addObject:@"待挂载"];
+    }
     if (info.hasSuicide)   [tags addObject:@"退出即杀"];
     if (info.hasAutoStart) [tags addObject:@"自启"];
 
@@ -143,9 +152,16 @@ static UIColor *RBLock(void)   { return [UIColor colorWithRed:1.00 green:0.78 bl
         self.memLabel.text = info.isRunning ? @"—" : @"";
     }
 
-    UIColor *onColor = info.locked ? RBLock() : RBAccent();
+    // 仅保活是降级：进程不会被回收，但系统仍可能把它挂起。用告警色区分，
+    // 不能和真正拿到场景的「真后台」同一个绿。待挂载则压成灰色 —— 那是配置开了没生效。
+    BOOL degraded = (info.hasBackstage && info.backstageLevel == 1);
+    BOOL pending  = (info.hasBackstage && info.backstageLevel == 0);
+    UIColor *onColor = info.locked ? RBLock()
+                     : degraded    ? RBWarn()
+                     : pending     ? [UIColor colorWithWhite:1 alpha:0.45]
+                                   : RBAccent();
     self.dot.hidden = !info.isRunning;
-    self.dot.backgroundColor = info.locked ? RBLock() : RBAccent();
+    self.dot.backgroundColor = onColor;
     if (tags.count) {
         self.stateLabel.textColor = onColor;
     } else if (info.isRunning && info.isSystem) {
@@ -545,6 +561,10 @@ static UIColor *RBLock(void)   { return [UIColor colorWithRed:1.00 green:0.78 bl
     self.loading = YES;
     NSUInteger seq = ++self.reloadSeq;
 
+    // 保护等级要在主线程取快照：RBBackstage 的字典是主线程写的，
+    // 后台线程直接读会和挂载/撤销撞在一起。快照很小（几十个 key），代价可以忽略。
+    NSDictionary<NSString *, NSNumber *> *levels = [[RBBackstage shared] levelSnapshot];
+
     dispatch_async(dispatch_get_global_queue(QOS_CLASS_USER_INITIATED, 0), ^{
         NSArray *apps = [RBProcesses installedApps];
         NSDictionary *running = [RBProcesses runningPids];
@@ -556,6 +576,7 @@ static UIColor *RBLock(void)   { return [UIColor colorWithRed:1.00 green:0.78 bl
             i.isRunning = pid != nil;
             i.pid = pid.intValue;
             i.hasBackstage = [store.backstageIDs containsObject:i.bundleID];
+            i.backstageLevel = levels[i.bundleID].integerValue;
             i.hasAutoStart = [store.autoStartIDs containsObject:i.bundleID];
             i.hasSuicide = [store.suicideIDs containsObject:i.bundleID];
             i.locked = [store.lockIDs containsObject:i.bundleID];
@@ -703,7 +724,7 @@ static UIColor *RBLock(void)   { return [UIColor colorWithRed:1.00 green:0.78 bl
     NSArray<NSString *> *lines = @[
         @"点一下看详情 · 右滑可锁定 / 自启 / 杀后台",
         @"绿点 = 有进程在跑 · 一键加速会结束未锁定的",
-        @"保活 = 留在后台不被挂起，会一直占用内存",
+        @"真后台 = 不被挂起（绿）· 仅保活 = 不被回收但仍会被挂起（橙）",
         @"自启 = 打开本工具时按名单重新拉起并保活",
         @"锁定 = 加速和退出清理都不碰，优先级最高",
     ];
@@ -900,7 +921,14 @@ static UIColor *RBLock(void)   { return [UIColor colorWithRed:1.00 green:0.78 bl
     if ([[RBBackstage shared] enableForBundle:info.bundleID pid:info.pid error:&err]) {
         [s.backstageIDs addObject:info.bundleID];
         [s save];
-        [self toast:[NSString stringWithFormat:@"%@ 已进入真后台", info.name]];
+        // 挂上不等于挂到场景。只拿到断言时如实说 —— 原来这里一律报「已进入真后台」，
+        // 用户在降级状态下会以为后台真的保住了。
+        NSInteger lv = [[RBBackstage shared] levelForBundle:info.bundleID];
+        if (lv == 2) {
+            [self toast:[NSString stringWithFormat:@"%@ 已进入真后台", info.name]];
+        } else {
+            [self toast:[NSString stringWithFormat:@"%@ 仅保活：进程不会被回收，但仍可能被挂起", info.name]];
+        }
     } else {
         [self toast:[NSString stringWithFormat:@"失败：%@", err.localizedDescription ?: @"未知原因"]];
     }
@@ -914,16 +942,26 @@ static UIColor *RBLock(void)   { return [UIColor colorWithRed:1.00 green:0.78 bl
     }
     if (targets.count == 0) { [self toast:@"没有需要处理的运行中 App"]; return; }
 
-    NSUInteger ok = 0;
+    NSUInteger ok = 0, scene = 0;
     RBStore *s = [RBStore shared];
     for (RBAppInfo *i in targets) {
         if ([[RBBackstage shared] enableForBundle:i.bundleID pid:i.pid error:NULL]) {
             [s.backstageIDs addObject:i.bundleID];
             ok++;
+            if ([[RBBackstage shared] levelForBundle:i.bundleID] == 2) scene++;
         }
     }
     [s save];
-    [self toast:[NSString stringWithFormat:@"已开启 %lu/%lu 个", (unsigned long)ok, (unsigned long)targets.count]];
+    // 把「场景」和「仅断言」分开报数。只报成功数会让人以为全部都在真跑。
+    if (ok == 0) {
+        [self toast:@"全部失败，检查日志"];
+    } else if (scene == ok) {
+        [self toast:[NSString stringWithFormat:@"已开启 %lu/%lu 个，全部拿到真后台场景",
+                    (unsigned long)ok, (unsigned long)targets.count]];
+    } else {
+        [self toast:[NSString stringWithFormat:@"已开启 %lu/%lu 个，其中 %lu 个只拿到保活断言",
+                    (unsigned long)ok, (unsigned long)targets.count, (unsigned long)(ok - scene)]];
+    }
     [self reload];
 }
 
