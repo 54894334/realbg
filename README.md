@@ -2,7 +2,7 @@
 
 基于对 **巨魔真后台 1.5**（`cn.bswbw.RealBackstage`，`RealBackstage_1.5.tipa`，358,657 字节）的静态逆向，**重写**的同功能 App —— 不是改包，源码级重建，所以后门、冗余权限、写死的路径一个都不继承。
 
-- 包名：`cn.bswbw.RealBG`　显示名：真后台 Pro　版本：1.4.0
+- 包名：`cn.bswbw.RealBG`　显示名：真后台 Pro　版本：1.4.1
 - 目标系统：iOS 14.0+（arm64 单切片）
 - 安装方式：TrollStore 直接装 `.tipa`，**不需要越狱**
 
@@ -391,7 +391,49 @@ if (seq < self.appliedSeq) { ...丢弃... }
 一键加速的语义就是「把后台清干净」，单个 App 已经有右键菜单的「杀后台」。
 再加一层强制开关只会让保护规则更复杂，而复杂度正是这次问题的来源。
 
-## 七、1.2.0：1.1.0 仍然秒退的真正原因
+## 七、1.4.1：真后台 ≠ 保活
+
+### 问题
+
+界面上勾了「真后台」的 App，列表一律显示「真后台」。
+
+但真后台有两条实现路径，效果不一样：
+
+| 路径 | 手段 | 实际效果 |
+|---|---|---|
+| 场景 | `FBSceneManager` 建 scene + `foreground=YES` | 系统认为它在前台渲染，**不被挂起** |
+| 断言 | `RBSAssertion` + `frontboard.Background` | 只声明「别回收」，**仍可能被挂起** |
+
+`enableForBundle:` 先试场景，失败才退回断言（`RBBackstage.m:216-217`）。
+于是「勾了真后台」可能对应三种真实状态，界面却只显示一种 ——
+降级成断言时，用户以为后台真的在跑，实际只是没被回收。这是**把降级报成成功**。
+
+### 修法
+
+1. `RBBackstage` 新增 `levelForBundle:`，返回 `2` 场景 / `1` 仅断言 / `0` 没挂上；
+   `isEnabledForBundle:` 改为 `levelForBundle: > 0`，判定口径只剩一处。
+2. `RBAppInfo` 增加 `backstageLevel`，`reload` 时填充。等级快照
+   （`levelSnapshot`）在**主线程**取好再交给后台枚举线程 —— 三本字典都是主线程写，
+   后台直接读会撞。
+3. 列表标签三分：
+   - `真后台`（绿）—— 拿到场景
+   - `仅保活`（橙）—— 只有断言，进程不会被回收但仍会被挂起
+   - `待挂载`（灰）—— 配置开了、运行时没挂上，多半是这个 App 没在运行
+4. 提示语同步改：单个开启只拿到断言时说「仅保活：进程不会被回收，但仍可能被挂起」；
+   批量开启分开报「已开启 N/M 个，其中 K 个只拿到保活断言」。
+5. 三本字典（scenes / assertions / pids）读写全部加 `@synchronized`，
+   避免后台枚举与主线程挂载/撤销并发写。
+
+### 判断口径
+
+- **真后台**：让正在跑的 App 不被系统挂起，代价是持续耗电和额外图形开销。
+- **保活**：只保证进程不被系统回收。App 仍可能被挂起，回到前台可能要重新加载。
+- **自启**：本工具启动时按名单拉起 App，再尝试挂真后台。
+
+真后台 ⊃ 保活：场景方案失败时才轮到断言，所以「真后台生效」一定包含保活，
+「保活生效」不代表是真后台。
+
+## 八、1.2.0：1.1.0 仍然秒退的真正原因
 
 1.1.0 装上去还是点开就退，而且「文件」App 里找不到本 App 的目录。这两条线索合起来指向一件事：
 **进程很可能根本没跑到 `main`**。围绕这个假设重新排查，找到三个真问题，其中一个是我自己在上一版里制造的。
@@ -574,7 +616,7 @@ com.apple.private.security.no-container  （原包也没有）
 | 7 | 产物校验新增 V7：逐个核对 `LC_LOAD_DYLIB` | 出现 `PrivateFrameworks` 直接判失败 |
 | 8 | 产物校验新增 `cryptid` / `LC_MAIN` 检查 | 非 0 cryptid、缺入口点都判失败 |
 
-## 八、1.1.0：闪退定位 + 保留名单
+## 九、1.1.0：闪退定位 + 保留名单
 
 ### 1. 闪退：找到两处真实的崩溃点
 
@@ -640,7 +682,7 @@ exe substringToIndex: r.location + r2.location + r2.length     // 少加了 r.le
 
 `r` 是 `/Bundle/Application/` 这个标记的 range。少加它的长度，截出来的路径整体左移 19 个字符，永远读不到 `Info.plist`，只能退化成用 `.app` 目录名当 bundleID。结果就是**进程枚举到的 bundleID 跟配置里存的对不上，「运行中」这个状态一直是错的**。现在改用字符串拼接，不再做索引算术。
 
-## 九、白苹果风险评估
+## 十、白苹果风险评估
 
 结论：**不会白苹果**。逐条说明为什么：
 
@@ -654,7 +696,7 @@ exe substringToIndex: r.location + r2.location + r2.length     // 少加了 r.le
 
 ---
 
-## 十、测试与验证（都是真实跑过的，不是"应该没问题"）
+## 十一、测试与验证（都是真实跑过的，不是"应该没问题"）
 
 ### 1. 产物硬校验 `tests/verify_tipa.py`（读真实字节）
 
@@ -672,7 +714,7 @@ V6 后门标记          com.example.myPort / CFMessagePort* / com.shadow.getEsp
 
 `V4` 不是"搜字符串有没有"，是真的把代码签名里的 SuperBlob 解开、把 entitlements 反序列化出来看的，12 条逐条列在脚本输出里。
 
-### 2. 源码逻辑测试 `tests/test_logic.py`（199 项，全通过）
+### 2. 源码逻辑测试 `tests/test_logic.py`（214 项，全通过）
 
 不是复述代码，而是**从真实源文件里解析出白名单/阈值/守卫**，再用这些真实数据跑判定：
 
@@ -706,7 +748,7 @@ CI 里两步都挂了：先跑 `test_logic.py`，出包后再跑 `verify_tipa.py
 第 1 项过不了（闪退）→ 多半是 iOS 版本与 `UIRootWindowScenePresentationBinder` 的类名差异，把 `设置 → 隐私 → 分析与改进 → 分析数据` 里的 `RealBG` 崩溃日志给我，能直接定位。
 第 3 项过不了 → 那台系统的 FBScene 路径变了，会看到日志「scene 方案异常」，会自动退回 RBS assertion 兜底（保活但 UI 状态可能重载）。
 
-## 十一、目录结构
+## 十二、目录结构
 
 ```
 Makefile                  Theos application 工程
@@ -726,7 +768,7 @@ tests/verify_tipa.py      产物硬校验（结构/Mach-O/签名 entitlements/�
 .github/workflows/build.yml  Theos 编译 → 组 .app → ldid 签 → 打 tipa → 硬校验 → 推 dist 分支
 ```
 
-## 十二、构建
+## 十三、构建
 
 CI 在 macOS runner 上跑 Theos，产物推到 `dist` 分支：
 
@@ -747,7 +789,7 @@ ldid -Sentitlements.plist "$APP/RealBG"
 mkdir -p Payload && cp -R "$APP" Payload/ && zip -qry RealBG.tipa Payload
 ```
 
-## 十三、用法
+## 十四、用法
 
 1. TrollStore 装 `RealBG.tipa`
 2. 打开要保活的 App，回本 App 里左滑 → **开启真后台**（或点右上「全部真后台」一键给所有运行中的 App 挂上）
