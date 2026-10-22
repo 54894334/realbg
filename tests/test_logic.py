@@ -159,6 +159,11 @@ check("dispatch_get_global_queue" in vc[_t1:_t2], "一键加速的进程枚举�
 check("RBHostPort" in root_src["RBProcesses.m"], "host 端口缓存复用（频繁 mach_host_self 会泄漏 send right）")
 check("bundleIDForPid" in root_src["RBProcesses.m"], "进程枚举复用同一套 pid -> bundleID 解析")
 
+mn = root_src["main.m"]
+check("performSuicideCleanup" in mn and "applicationDidEnterBackground" in mn,
+      "「退出即杀」名单真的执行（第一版只存不读，开关是摆设）")
+check("[protect containsObject:bid]" in mn, "退出清理时真后台白名单优先，不冲突误杀")
+
 print("\n== 4. 源码级后门回归（原包有、本包必须没有） ==")
 all_src = "\n".join(strip_comments(read(f)) for f in sorted(os.listdir(SRC)) if f.endswith((".m", ".h")))
 FORBIDDEN = [

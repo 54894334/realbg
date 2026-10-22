@@ -11,6 +11,7 @@
 @interface RBAppDelegate : UIResponder <UIApplicationDelegate>
 @property (nonatomic, strong) UIWindow *window;
 - (void)restoreAutoStart;
+- (void)performSuicideCleanup;
 @end
 
 @implementation RBAppDelegate
@@ -76,6 +77,28 @@
     // 自己进后台时把真后台的 scene 保留着（本 App 被挂起后 scene 会断，
     // 所以这里不主动清理，交给系统按需回收）
     RBLog(@"进入后台，已挂载：%@", [[RBBackstage shared] enabledBundles]);
+    [self performSuicideCleanup];
+}
+
+/// 「退出本 App 时结束」名单里的 App，在本 App 退到后台时清理掉。
+/// 第一版这里只把选择存进 plist，没有任何代码读它 —— 开关点了等于没点。
+/// 真后台白名单里的不杀（两个名单冲突时保活优先）。
+- (void)performSuicideCleanup {
+    NSSet *suicide = [[RBStore shared].suicideIDs copy];
+    if (suicide.count == 0) return;
+    NSSet *protect = [[RBStore shared].backstageIDs copy];
+
+    dispatch_async(dispatch_get_global_queue(QOS_CLASS_UTILITY, 0), ^{
+        NSDictionary *running = [RBProcesses runningPids];
+        NSInteger n = 0;
+        for (NSString *bid in suicide) {
+            if ([protect containsObject:bid]) continue;      // 真后台优先
+            NSNumber *pid = running[bid];
+            if (!pid) continue;                              // 没在跑就不用管
+            if ([RBProcesses killApp:bid pid:pid.intValue]) n++;
+        }
+        RBLog(@"退出清理：结束 %ld 个", (long)n);
+    });
 }
 
 @end

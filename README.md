@@ -149,7 +149,7 @@ mach-lookup: frontboard.systemappservices / runningboardd  连这两个服务
 
 ---
 
-## 四、第二版复查：15 个 bug + 安全复核
+## 四、第二版复查：16 个 bug + 安全复核
 
 第二版把整个工程当陌生代码重读了一遍，逐条对着源码找问题。下面每一条都能在源码里指出位置，
 并且都已在 `tests/test_logic.py` 里加了对应断言（第 3.5 节），防止以后改回去。
@@ -171,6 +171,7 @@ mach-lookup: frontboard.systemappservices / runningboardd  连这两个服务
 | 13 | `kill()` 跨 uid 会 EPERM（App 杀不到别的 uid 进程） | 加速可能一个都杀不掉，白点 | 失败自动走 RunningBoard `terminateWithExplanation:` |
 | 14 | 系统 App 只靠 28 条清单拦 | 清单随 iOS 版本会漏，漏一个就可能杀到系统 App | 加 `com.apple.*` 前缀整片拦，清单降级成第二道保险 |
 | 15 | 日志里 `paths.count - scan.count` 用的是合并后的值 | 打出来的数字是负的/乱的 | 先存 `lsCount` 再合并 |
+| 16 | 「切走即杀」只把选择写进 plist，**没有任何代码读它** | 开关点了等于没点（假功能） | 实现成「退出本 App 时结束」，退后台时真正清理，真后台白名单优先；文案同步改成「退出即杀」 |
 
 ### 安全复核（第二版新增的能力）
 
@@ -224,7 +225,7 @@ V6 后门标记          com.example.myPort / CFMessagePort* / com.shadow.getEsp
 
 `V4` 不是"搜字符串有没有"，是真的把代码签名里的 SuperBlob 解开、把 entitlements 反序列化出来看的，12 条逐条列在脚本输出里。
 
-### 2. 源码逻辑测试 `tests/test_logic.py`（76 项，全通过）
+### 2. 源码逻辑测试 `tests/test_logic.py`（78 项，全通过）
 
 不是复述代码，而是**从真实源文件里解析出白名单/阈值/守卫**，再用这些真实数据跑判定：
 

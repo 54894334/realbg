@@ -93,7 +93,7 @@ static UIColor *RBWarn(void)   { return [UIColor colorWithRed:1.00 green:0.42 bl
     NSMutableArray *tags = [NSMutableArray array];
     if (info.hasBackstage) [tags addObject:@"真后台"];
     if (info.hasAutoStart) [tags addObject:@"自启"];
-    if (info.hasSuicide)   [tags addObject:@"切走即杀"];
+    if (info.hasSuicide)   [tags addObject:@"退出即杀"];
 
     if (info.isRunning) {
         self.spin.hidden = NO;
@@ -458,7 +458,7 @@ static UIColor *RBWarn(void)   { return [UIColor colorWithRed:1.00 green:0.42 bl
             [self reloadAfterDelay];
         }]];
     }
-    [ac addAction:[UIAlertAction actionWithTitle:(info.hasSuicide ? @"取消「切走即杀」" : @"开启「切走即杀」")
+    [ac addAction:[UIAlertAction actionWithTitle:(info.hasSuicide ? @"取消「退出即杀」" : @"开启「退出即杀」")
                                            style:UIAlertActionStyleDefault
                                          handler:^(UIAlertAction *a) {
         RBStore *s = [RBStore shared];
