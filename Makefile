@@ -11,7 +11,7 @@ include $(THEOS)/makefiles/common.mk
 APPLICATION_NAME = RealBG
 
 RealBG_FILES = src/main.m src/RBRootVC.m src/RBStore.m src/RBProcesses.m \
-               src/RBBackstage.m src/RBBooster.m src/RBCrash.m
+               src/RBBackstage.m src/RBBooster.m src/RBCrash.m src/RBAppInfo.m
 RealBG_CFLAGS = -fobjc-arc -I src \
 	-Wno-deprecated-declarations -Wno-unused-function -Wno-unused-variable \
 	-Wno-objc-method-access -Wno-undeclared-selector -Wno-format \

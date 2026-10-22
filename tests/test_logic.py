@@ -348,6 +348,49 @@ check("PrivateFrameworks" not in vt.split("ALLOWED_DYLIB_PREFIXES")[1].split(")"
 check("cryptid" in vt, "verify 检查 cryptid（非 0 说明还带 FairPlay 加密壳）")
 check("LC_MAIN" in vt, "verify 检查 LC_MAIN（没有入口点会启动即退）")
 
+print("\n== 13. 类实现完整性（1.0.0–1.1.0 秒退的真正根因） ==")
+# 背景：RBAppInfo 只在 RB.h 里 @interface，全工程没有 @implementation，
+# 而 RBProcesses.m 里写了 [RBAppInfo new]。因为当时带 -Wl,-undefined,dynamic_lookup，
+# 链接器不检查，产物照样出。但 _OBJC_CLASS_$_RBAppInfo 在 dyld 里是启动时
+# 立即绑定的，找不到就杀进程 —— 崩在 main 之前，日志一字节都写不出来。
+all_m = {}
+for _f in sorted(_os.listdir(SRC)):
+    if _f.endswith(".m"):
+        all_m[_f] = strip_comments(read(_f))
+
+hdr = strip_comments(read("RB.h"))
+declared = set(re.findall(r"@interface\s+([A-Za-z_]\w*)", hdr))
+implemented = set()
+for _src in all_m.values():
+    implemented |= set(re.findall(r"@implementation\s+([A-Za-z_]\w*)", _src))
+
+missing_impl = sorted(declared - implemented)
+check(not missing_impl, "RB.h 里声明的 %d 个类全部有 @implementation" % len(declared),
+      "缺实现: %s" % missing_impl if missing_impl else "")
+
+# 更严：源码里凡是对本工程前缀类发 [XxxClass new]/shared 消息，那个类必须已实现
+used = set()
+for _src in all_m.values():
+    used |= set(re.findall(r"\[\s*(RB[A-Za-z]\w*)\s+(?:new|shared\w*|alloc)\]", _src))
+        # 允许 [RBProcesses class] 这类反射调用
+unimpl_used = sorted(u for u in used if u not in implemented)
+check(not unimpl_used, "所有被 [Xxx new]/[Xxx sharedXxx] 使用的 RB 类都已实现",
+      "用了但没实现: %s" % unimpl_used if unimpl_used else "")
+
+check("RBAppInfo" in implemented, "RBAppInfo 已有实现（1.1.0 就是缺它导致 dyld 秒退）")
+
+# Makefile 必须把 src 下每个 .m 都编进去，漏一个就是同类灾难
+files_line = re.search(r"RealBG_FILES\s*=\s*(.*?)(?:\n[A-Za-z]|\Z)", mk, re.S)
+listed = set(re.findall(r"src/([A-Za-z_]\w*\.m)", files_line.group(1))) if files_line else set()
+on_disk = set(f for f in _os.listdir(SRC) if f.endswith(".m"))
+not_built = sorted(on_disk - listed)
+check(not not_built, "Makefile 的 RealBG_FILES 收录了 src 下全部 %d 个 .m" % len(on_disk),
+      "漏编: %s" % not_built if not_built else "")
+
+# 反转：链接器不允许再被放开
+check("dynamic_lookup" not in mk_code,
+      "仍然不允许 dynamic_lookup（它就是让上面这些问题一直没被发现的元凶）")
+
 print("\n" + "=" * 56)
 print("通过 %d 项，失败 %d 项" % (len(passed), len(failed)))
 if failed:

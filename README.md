@@ -193,7 +193,190 @@ entitlements 仍是 12 条，一条没加。仍然没有：网络、IPC、`dlope
 | scene 挂载 | iOS 16/17/18 的 FrontBoard 类名/方法名有差异，失败会自动退回 RBS assertion（保活但可能重载 UI） |
 | 加速效果 | 只动第三方 App；系统 App、真后台白名单、8MB 以下的一律不动，所以「释放量」不会很夸张 |
 
-## 五、1.1.0：闪退定位 + 保留名单
+## 五、1.2.0：1.1.0 仍然秒退的真正原因
+
+1.1.0 装上去还是点开就退，而且「文件」App 里找不到本 App 的目录。这两条线索合起来指向一件事：
+**进程很可能根本没跑到 `main`**。围绕这个假设重新排查，找到三个真问题，其中一个是我自己在上一版里制造的。
+
+### 1. 「文件」App 里没有目录，其实不是故障
+
+TrollStore 官方文档（`opa334/TrollStore` 的 App Registration States 一节）写得很清楚：
+
+| 属性 | System 注册（TrollStore 应用必须的状态） | User 注册 |
+|---|---|---|
+| 能否启动 | ✅ 能（CoreTrust 绕过生效） | ❌ 崩（Invalid Signature） |
+| 设置里可见 | ❌ 隐藏 | ✅ 可见 |
+| **iTunes 文件共享** | **❌ 禁用** | ✅ 启用（若 `UIFileSharingEnabled`） |
+
+也就是说，**TrollStore 装的 App 一旦注册为 System 状态（这是能启动的前提），iOS 就不给它显示文件共享目录**。
+所以「文件 App 里没有真后台 Pro」是正常现象，不能拿来判断 App 有没有启动过。我上一版把它当成「App 没起来」的证据，方向错了。
+
+顺带说明同一张表里的第二行：**「装完点开就闪退」在 TrollStore 里最常见的头号原因是 App 被降级回 User 注册**（图标缓存重载、系统更新、或装的时候没选对状态）。这种情况在 TrollStore 里点开这个 App，会看到一个「Switch to 'System' Registration」选项。
+
+### 2. 真正的病根：`RBAppInfo` 只有声明，没有实现
+
+删掉 `dynamic_lookup` 之后，CI 第一次链接就直接把这个错误甩了出来：
+
+```
+Undefined symbols for architecture arm64:
+  "_OBJC_CLASS_$_RBAppInfo", referenced from:
+       in RBProcesses.m.38f474ca.o
+ld: symbol(s) not found for architecture arm64
+```
+
+**`RBAppInfo` 这个类，`RB.h` 里有完整的 `@interface`（10 个属性），但整个工程没有一处 `@implementation`。** 而 `RBProcesses.m` 的 `installedApps` 里写了：
+
+```objc
+RBAppInfo *info = [RBAppInfo new];
+```
+
+这条链是这样断的：
+
+1. `_OBJC_CLASS_$_RBAppInfo` 是 ObjC 类引用，在 dyld 里属于**启动时立即绑定**（不是 lazy binding）
+2. 进程一启动，dyld 就去解析这个符号
+3. 整个二进制里没有任何模块定义过它 → `Symbol not found`
+4. dyld 直接终止进程
+
+而 dyld 这一步发生在 **`main` 之前**。所以：
+
+| 观察到的现象 | 原因 |
+|---|---|
+| 点图标闪一下回桌面 | dyld 在绑定阶段杀掉进程 |
+| 日志一个字节都没有 | `RBInstallCrashHandler()` 在 `main` 里，根本没执行到 |
+| 「文件」App 里没有目录 | `RBLogDirectory()` 也没执行，目录从没被创建 |
+| 崩溃捕获抓不到任何东西 | 同上，捕获代码在崩溃之后才应该执行 |
+
+**为什么拖了三个版本才发现**：`-Wl,-undefined,dynamic_lookup` 让链接器放弃了符号检查，产物照样生成、CI 照样绿、`nm -u` 里那一长串 undefined 也被我当成「正常的外部依赖」扫过去了。这是整件事里最值得记住的教训 —— **不是代码难，是自己把报警器关了**。
+
+修法不只是补一个文件，而是加了两条硬回归（`tests/test_logic.py` 第 13 节）：
+
+| 断言 | 作用 |
+|---|---|
+| `RB.h` 里每个 `@interface` 都必须有对应 `@implementation` | 声明了不实现 = 链接期报错，不允许流到产物 |
+| 凡是被 `[Xxx new]` / `[Xxx sharedXxx]` / `[Xxx alloc]` 使用的 `RB*` 类，都必须已实现 | 抓「用了但没实现」，比只看头文件更严 |
+| Makefile 的 `RealBG_FILES` 必须收录 `src` 下全部 `.m` | 新文件忘了加进 Makefile 也是同一类灾难 |
+| 不允许再出现 `dynamic_lookup` | 报警器不许关 |
+
+### 3. 真正的病根一：`-Wl,-undefined,dynamic_lookup`
+
+上一版 Makefile 里有这一行：
+
+```make
+RealBG_LDFLAGS = -Wl,-undefined,dynamic_lookup
+```
+
+当时的想法是「私有框架符号都走 NSClassFromString 了，加这个兜底更保险」。实际上它做的事正好相反：
+**它让链接器放弃检查任何一个符号是否存在**，全部推到运行时由 dyld 解析。
+
+于是只要 iOS 上少一个符号（版本差异、私有符号、跨系统版本），dyld 就会在这一步失败并 **直接杀掉进程** —— 而这一步发生在 `main` 之前。结果就是：
+
+- 点图标 → 闪一下回桌面
+- App 自己一行日志都写不出来（`RBInstallCrashHandler` 还没执行）
+- 连崩溃捕获都抓不到（根本没跑到装捕获的那一行）
+
+这和观察到的现象完全吻合。已删除，改回正常链接：**符号有问题在 CI 阶段就报错，不会流到手机上**。
+
+### 4. 真正的病根二：两个高版本差异的符号
+
+去掉 `dynamic_lookup` 之后，链接器会盯住每一个符号。其中两个有真实的版本风险：
+
+| 符号 | 风险 | 处理 |
+|---|---|---|
+| `proc_pid_rusage` | 单进程内存占用。存在版本差异，跨 uid 也可能直接失败 | 改成 `dlsym(RTLD_DEFAULT, ...)` 取函数指针，取不到就降级（数字显示 `~24 MB` 估值），**二进制里不留未定义引用** |
+| `backtrace` | iOS 上 `execinfo` 不是官方承诺的稳定接口 | 同样走 `dlsym`，而且函数指针在**安装阶段**（安全上下文）预先取好 |
+
+后一条还有个容易忽略的坑：`dlsym` 和 `dispatch_once` 内部都有锁，**绝对不能放进信号处理函数里**——信号恰好打断持锁线程就是死锁，崩溃日志反而写不出来。所以指针是在 `RBInstallCrashHandler()` 里赋值的，信号处理里只读全局变量。
+
+### 5. 真正的病根三：entitlements 被我自己改坏了
+
+这是 1.1.0 里最要命的一处。当时的推理是「`no-sandbox` 需要配 `no-container`」，于是加了一条 —— 但那是错的。
+
+TrollStore 官方 README 原文：
+
+> 你的应用可以用以下之一来运行未沙盒化：
+> `com.apple.private.security.container-required` / `com.apple.private.security.no-container` / `com.apple.private.security.no-sandbox`
+> **第三个是推荐的，如果你还想要一个沙盒容器。**
+> 你可能还需要 `platform-application` 才能让这些正常工作。
+> 请注意 `platform-application` 会导致一些副作用，例如沙盒的某些部分变得更严格，因此**你可能需要额外的私有权限来规避**。
+
+对照原包 1.5（**它在这台手机上是能正常启动的**）：
+
+| | 原包 1.5 | 1.1.0（会闪退） |
+|---|---|---|
+| `no-sandbox` | 有 | 有 |
+| `no-container` | **没有** | **加了** ← 导致 App 连自己的容器都没有 |
+| `platform-application` | 有 | 有 |
+| `backboard.client` | 有 | **删了** ← 拿不到显示连接 |
+| `QuartzCore.displayable-context` / `secure-mode` | 有 | **删了** ← 图层不可显示/上屏 |
+| `springboard.accessibility-window-hosting` | 有 | **删了** |
+| `springboard.appbackgroundstyle` | 有 | **删了** |
+| `file-read-data` | 有 | **删了** |
+
+也就是说：**留着带来副作用的 `platform-application`，却把它需要的补偿权限全砍了，还额外加了一条原包根本没有的 `no-container`。** 三条叠加，启动阶段被拒是完全合理的。
+
+1.2.0 的权限清单按「原包功能性权限的最小集」重做，共 18 条，每条都对应一个具体功能。**仍然坚决不带**任何提权/后门性质的项：
+
+```
+task_for_pid-allow                       读写任意 App 内存
+com.apple.system-task-ports(.control)    拿系统任务端口
+com.apple.private.hid.*（4 条）          监听 / 模拟硬件输入
+com.apple.private.kernel.jetsam          内存压力仲裁
+com.apple.private.memorystatus           改别的进程内存状态
+com.apple.private.persona-mgmt           以 root 身份派生进程
+proc_info-allow                          读所有进程信息
+get-task-allow                           允许被调试
+com.apple.security.iokit-user-client-class（24 条）全放行
+com.apple.runningboard.hereditarygrantoriginator / primitiveattribute
+com.apple.private.allow-background-haptics
+com.apple.private.security.no-container  （原包也没有）
+```
+
+### 6. 新增：lite 探针包，用来一刀切开问题域
+
+猜三轮不如做一次干净的二分。这次同时出两个包：
+
+| 包 | 内容 | 用途 |
+|---|---|---|
+| `RealBG.tipa` | 完整功能 | 正常使用 |
+| `RealBGLite.tipa` | 只有一个绿底页面写着 `LITE OK` + bundle id + iOS 版本 | **判定问题在哪一层** |
+
+探针包故意做到极简：不调用任何私有 API、不链接任何私有框架、不写日志、不装信号处理器，权限只有 2 条（`platform-application` + `no-sandbox`）。
+
+判定方式：
+
+- **探针能开、完整版闪退** → 问题在完整版的代码或那 18 条权限里
+- **探针也闪退** → 问题在打包 / 签名 / TrollStore 注册状态，跟代码无关，去 TrollStore 里看有没有「Switch to 'System' Registration」
+
+### 7. 崩溃日志到底该去哪看
+
+`RBInstallCrashHandler` 写的文件确实在 App 容器的 Documents 里，但**System 注册下「文件」App 不显示它**（见上面第 1 条）。所以正确的位置是系统级的：
+
+**设置 → 隐私与安全性 → 分析与改进 → 分析数据**，按字母排序找 **`RealBG`** 开头的条目（形如 `RealBG-2026-10-23-101530.ips`）。
+
+这个位置的好处是：**连 dyld 在 main 之前崩掉的记录也有**。打开后看两个字段就能定性：
+
+| 字段 | 值 | 含义 |
+|---|---|---|
+| `Termination Reason` | `CODESIGNING 1 Invalid Page` | 签名 / 代码页哈希不对 |
+| `Termination Reason` | `Library load` | 某个 dylib 加载失败 |
+| `Termination Reason` | `Entitlements` | 权限组合被系统拒绝 |
+| `Exception Type` | `EXC_CRASH (SIGKILL)` + 无栈 | 基本是上面三种之一，或注册状态掉了 |
+| `Exception Type` | `EXC_BAD_ACCESS` + 有栈 | 我们代码里的问题，栈顶会指向具体函数 |
+
+### 8. 这轮修的东西（都在 `tests/test_logic.py` 里有对应断言）
+
+| # | 改动 | 断言 |
+|---|---|---|
+| 1 | 删掉 `-Wl,-undefined,dynamic_lookup` | Makefile 里查不到这个字符串 |
+| 2 | `proc_pid_rusage` 走 `dlsym` + 判空 | 源码里有 `dlsym(RTLD_DEFAULT, "proc_pid_rusage")` |
+| 3 | `backtrace` 走 `dlsym`，指针在安装阶段取 | 信号处理函数体内不含 `dispatch_once` |
+| 4 | 去掉 `no-container`，补回 `platform-application` 的补偿权限 | 权限条数 = 18，且不含 `no-container` |
+| 5 | 全工程不允许 `__attribute__((constructor))` | 源码扫描 |
+| 6 | 探针包本身也纳入测试 | 探针源码不含任何私有 API、不链接私有框架、权限 = 2 |
+| 7 | 产物校验新增 V7：逐个核对 `LC_LOAD_DYLIB` | 出现 `PrivateFrameworks` 直接判失败 |
+| 8 | 产物校验新增 `cryptid` / `LC_MAIN` 检查 | 非 0 cryptid、缺入口点都判失败 |
+
+## 六、1.1.0：闪退定位 + 保留名单
 
 ### 1. 闪退：找到两处真实的崩溃点
 
@@ -259,7 +442,7 @@ exe substringToIndex: r.location + r2.location + r2.length     // 少加了 r.le
 
 `r` 是 `/Bundle/Application/` 这个标记的 range。少加它的长度，截出来的路径整体左移 19 个字符，永远读不到 `Info.plist`，只能退化成用 `.app` 目录名当 bundleID。结果就是**进程枚举到的 bundleID 跟配置里存的对不上，「运行中」这个状态一直是错的**。现在改用字符串拼接，不再做索引算术。
 
-## 六、白苹果风险评估
+## 七、白苹果风险评估
 
 结论：**不会白苹果**。逐条说明为什么：
 
@@ -273,7 +456,7 @@ exe substringToIndex: r.location + r2.location + r2.length     // 少加了 r.le
 
 ---
 
-## 七、测试与验证（都是真实跑过的，不是"应该没问题"）
+## 八、测试与验证（都是真实跑过的，不是"应该没问题"）
 
 ### 1. 产物硬校验 `tests/verify_tipa.py`（读真实字节）
 
@@ -291,7 +474,7 @@ V6 后门标记          com.example.myPort / CFMessagePort* / com.shadow.getEsp
 
 `V4` 不是"搜字符串有没有"，是真的把代码签名里的 SuperBlob 解开、把 entitlements 反序列化出来看的，12 条逐条列在脚本输出里。
 
-### 2. 源码逻辑测试 `tests/test_logic.py`（122 项，全通过）
+### 2. 源码逻辑测试 `tests/test_logic.py`（149 项，全通过）
 
 不是复述代码，而是**从真实源文件里解析出白名单/阈值/守卫**，再用这些真实数据跑判定：
 
@@ -325,7 +508,7 @@ CI 里两步都挂了：先跑 `test_logic.py`，出包后再跑 `verify_tipa.py
 第 1 项过不了（闪退）→ 多半是 iOS 版本与 `UIRootWindowScenePresentationBinder` 的类名差异，把 `设置 → 隐私 → 分析与改进 → 分析数据` 里的 `RealBG` 崩溃日志给我，能直接定位。
 第 3 项过不了 → 那台系统的 FBScene 路径变了，会看到日志「scene 方案异常」，会自动退回 RBS assertion 兜底（保活但 UI 状态可能重载）。
 
-## 八、目录结构
+## 九、目录结构
 
 ```
 Makefile                  Theos application 工程
@@ -345,7 +528,7 @@ tests/verify_tipa.py      产物硬校验（结构/Mach-O/签名 entitlements/�
 .github/workflows/build.yml  Theos 编译 → 组 .app → ldid 签 → 打 tipa → 硬校验 → 推 dist 分支
 ```
 
-## 九、构建
+## 十、构建
 
 CI 在 macOS runner 上跑 Theos，产物推到 `dist` 分支：
 
@@ -366,7 +549,7 @@ ldid -Sentitlements.plist "$APP/RealBG"
 mkdir -p Payload && cp -R "$APP" Payload/ && zip -qry RealBG.tipa Payload
 ```
 
-## 十、用法
+## 十一、用法
 
 1. TrollStore 装 `RealBG.tipa`
 2. 打开要保活的 App，回本 App 里左滑 → **开启真后台**（或点右上「全部真后台」一键给所有运行中的 App 挂上）
