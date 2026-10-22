@@ -25,6 +25,10 @@ jobs:
           cp -R /tmp/sdks-master/*.sdk "$THEOS/sdks/" || true
           echo "THEOS=$THEOS" >> "$GITHUB_ENV"
 
+      - name: 源码逻辑测试（白名单/守卫/后门回归）
+        run: |
+          python3 tests/test_logic.py .
+
       - name: 编译
         run: |
           make clean || true
@@ -58,6 +62,10 @@ jobs:
           unzip -l RealBG.tipa
           unzip -l RealBG.tipa | grep -q "Payload/RealBG.app/Info.plist" || { echo "缺 Info.plist"; exit 1; }
           ls -la RealBG.tipa
+
+      - name: 产物硬校验（结构 / Mach-O / 签名里的 entitlements / 后门标记）
+        run: |
+          python3 tests/verify_tipa.py RealBG.tipa
 
       - uses: actions/upload-artifact@v4
         with:

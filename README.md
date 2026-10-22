@@ -87,6 +87,39 @@ mach-lookup: frontboard.systemappservices / runningboardd  连这两个服务
 
 审计结论：**原包没有任何网络代码** —— 0 个 http/socket 符号，只有 `t.me`（TG 频道）、PayPal、支付宝三个「打开链接」的按钮字符串。所以这块不是后门，但本工程连这三个按钮也不带。
 
+### 5. 具备卸载任意 App 的能力（未在本工程保留）
+
+解密字符串里同时出现：
+
+```
+0x100053d90  'com.shadow.getEspDataQueue'
+0x100053e40  'uninstall'
+0x100053e54  'installd'
+0x100053e70  'com.opa334.TrollStore'
+0x100053ef0  'trollstorehelper'
+0x100053f30  'applicationProxyForIdentifier:'
+```
+
+`trollstorehelper` + `uninstall` + `installd` 这一组说明原包能借 TrollStore 的 root helper 走 `installd` 卸载任意已安装应用。真后台不需要卸载能力，**本工程一行都没有**（只用 `kill()` 结束进程）。
+
+### 6. 实测证据：解密出来的原包字符串（节选）
+
+`tools/m6_strdec.py` 从原二进制静态还原 **85 条**运行时 XOR 加密字符串，其中与后门/配置相关的关键条目：
+
+| 地址 | 字符串 | 含义 |
+|---|---|---|
+| `0x100054d40` | `com.example.myPort` | 全局 CFMessagePort 名，示例代码没改 → 无鉴权 IPC |
+| `0x100053d90` | `com.shadow.getEspDataQueue` | 自建 GCD 队列名，带 `shadow` 前缀 |
+| `0x100053ef0` | `trollstorehelper` | 调 TrollStore root helper |
+| `0x100058760` | `/var/mobile/Library/Preferences/com.thefool.app.plist` | 写死别人的配置路径 |
+| `0x100055492` | `WhiteList` | 真后台白名单键名 |
+| `0x1000551b2` | `SuicideList` | 切走即杀列表键名 |
+| `0x100058a60` | `[KillCheck] %@ (pid %d) -> role: %@ (%d)` | 杀进程日志格式 |
+| `0x100059060`~`0x100059100` | `Darwinbg` `Throttle` `GfxServer` `Default` `Inactive` `Background` `Foreground` `Reniced` | RunningBoard 断言/进程角色名 |
+| `0x100059ee0` | `RealBackstage://YFF` | URL scheme |
+
+本工程的键名沿用 `WhiteList` / `AutoStart` / `SuicideList`，其余一个不带。
+
 ---
 
 ## 三、新增：一键加速
@@ -130,7 +163,59 @@ mach-lookup: frontboard.systemappservices / runningboardd  连这两个服务
 
 ---
 
-## 五、目录结构
+## 五、测试与验证（都是真实跑过的，不是"应该没问题"）
+
+### 1. 产物硬校验 `tests/verify_tipa.py`（读真实字节）
+
+对着 CI 出来的 `RealBG.tipa`（85,313 B）跑，结果：
+
+```
+V1 包结构            Info.plist 1620 B / RealBG 308560 B / 图标 3 个
+V2 Info.plist        cn.bswbw.RealBG · 真后台 Pro · 1.0.0(1) · iOS15.0 · 1,2
+V3 Mach-O            FAT 2 切片：arm64 MH_EXECUTE 146048 B
+                                  arm64e MH_EXECUTE 144720 B
+V4 签名 entitlements  两个切片各解出 12 条（解 LC_CODE_SIGNATURE -> SuperBlob type5）
+V5 危险权限          12 项全部为 0
+V6 后门标记          com.example.myPort / CFMessagePort* / com.shadow.getEspDataQueue 全无
+```
+
+`V4` 不是"搜字符串有没有"，是真的把代码签名里的 SuperBlob 解开、把 entitlements 反序列化出来看的，12 条逐条列在脚本输出里。
+
+### 2. 源码逻辑测试 `tests/test_logic.py`（61 项，全通过）
+
+不是复述代码，而是**从真实源文件里解析出白名单/阈值/守卫**，再用这些真实数据跑判定：
+
+| 分组 | 覆盖 |
+|---|---|
+| 白名单完整性 | 从 `RBProcesses.m` 抠出 35 条守护进程 + 28 条系统 App，逐条断言 launchd / SpringBoard / backboardd / runningboardd / frontboardd / securityd / tccd / cfprefsd / installd / watchdogd 都在 |
+| 杀进程守卫 | `pid<=1` 拒绝、`pid==getpid()` 拒绝、EPERM 降级 SIGTERM、`killApp:` 二次拦截 |
+| 一键加速过滤 | 阈值读的是源码里的 `mb < 8`；用混合进程表验证「微信 480MB 留、抖音 6MB 跳过、真后台白名单跳过、SpringBoard 跳过」 |
+| 后门回归 | 去注释后扫 `task_for_pid` / `processor_set_tasks` / `CFMessagePort` / `NSURLSession` / `http` / `trollstorehelper` / `MSHookFunction` / `dlopen`，全部为 0 |
+| 配置路径 | 写入是 `cn.bswbw.RealBG.plist`；`com.thefool.app.plist` 只出现在 `dictionaryWithContentsOfFile:legacy` 一行，无 `writeToFile:legacy` |
+| entitlements | 条数 = 12，7 项高危 + `hid.*` 全部不在 |
+| 结构 | 8 个源文件齐、`ARCHS := arm64 arm64e`、application 目标（不是 tweak） |
+
+CI 里两步都挂了：先跑 `test_logic.py`，出包后再跑 `verify_tipa.py`，任一失败就构建失败 —— 也就是说 dist 分支上的包，一定是这两关都过的。
+
+### 3. 真机验收（需要你在 iPhone 上做，脚本没法代替）
+
+以下 8 项必须真机点，静态分析无法覆盖：
+
+| # | 步骤 | 期望 |
+|---|---|---|
+| 1 | TrollStore 装 `RealBG.tipa` | 出现在桌面，名字「真后台 Pro」，能打开不闪退 |
+| 2 | 打开微信 → 回本 App，右滑微信 → **开启真后台** | 提示「微信 已进入真后台」 |
+| 3 | 切回微信，再按 Home 回桌面，等 2 分钟 | 微信**没被回收**，切回来还在原页面 |
+| 4 | 底部看内存标签 | 三个数字都非 0，且「可用」与「已用」之和接近物理内存 |
+| 5 | 点 **一键加速** | 弹窗列出候选进程与各自 MB，数字非 0 |
+| 6 | 确认加速 | 弹结果：结束 N 个、释放 X MB、可用 before→after |
+| 7 | 加速后再看微信（若已加真后台） | **仍然活着**（白名单生效） |
+| 8 | 重启手机，再打开本 App | 之前加「自启」的 App 若在运行，日志里 `自启真后台已恢复` |
+
+第 1 项过不了（闪退）→ 多半是 iOS 版本与 `UIRootWindowScenePresentationBinder` 的类名差异，把 `设置 → 隐私 → 分析与改进 → 分析数据` 里的 `RealBG` 崩溃日志给我，能直接定位。
+第 3 项过不了 → 那台系统的 FBScene 路径变了，会看到日志「scene 方案异常」，会自动退回 RBS assertion 兜底（保活但 UI 状态可能重载）。
+
+## 六、目录结构
 
 ```
 Makefile                  Theos application 工程
@@ -145,10 +230,12 @@ src/RBBooster.m           一键加速（新增）
 src/RBRootVC.m            主界面：分段筛选 + 搜索 + 左右滑操作 + 底部加速条
 RealBG/Info.plist         包信息（cn.bswbw.RealBG，真后台 Pro，1.0.0）
 RealBG/AppIcon*.png       图标 60/120/180
-.github/workflows/build.yml  Theos 编译 → 组 .app → ldid 签 → 打 tipa → 推 dist 分支
+tests/test_logic.py       源码逻辑测试（61 项：白名单/守卫/后门回归）
+tests/verify_tipa.py      产物硬校验（结构/Mach-O/签名 entitlements/后门标记）
+.github/workflows/build.yml  Theos 编译 → 组 .app → ldid 签 → 打 tipa → 硬校验 → 推 dist 分支
 ```
 
-## 六、构建
+## 七、构建
 
 CI 在 macOS runner 上跑 Theos，产物推到 `dist` 分支：
 
@@ -169,7 +256,7 @@ ldid -Sentitlements.plist "$APP/RealBG"
 mkdir -p Payload && cp -R "$APP" Payload/ && zip -qry RealBG.tipa Payload
 ```
 
-## 七、用法
+## 八、用法
 
 1. TrollStore 装 `RealBG.tipa`
 2. 打开要保活的 App，回本 App 里左滑 → **开启真后台**（或点右上「全部真后台」一键给所有运行中的 App 挂上）
