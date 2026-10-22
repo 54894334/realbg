@@ -14,7 +14,7 @@
 #import <UIKit/UIKit.h>
 #import <Foundation/Foundation.h>
 
-#define RB_VERSION @"1.2.0"
+#define RB_VERSION @"1.3.0"
 #define RB_BUNDLE @"cn.bswbw.RealBG"
 
 // 配置：/var/mobile/Library/Preferences/cn.bswbw.RealBG.plist
@@ -59,7 +59,12 @@
 + (NSArray<RBAppInfo *> *)installedApps;
 /// 正在运行的 pids（bundleID -> pid）
 + (NSDictionary<NSString *, NSNumber *> *)runningPids;
-/// 结束单个进程；返回是否成功
+/// 进程是否真的还活着。kill(pid,0) 只能证明「信号投递没被拒」，
+/// 僵尸进程同样会回 0；这里再加一层 proc_pidpath 确认，僵尸取不到路径。
++ (BOOL)isPidAlive:(pid_t)pid;
+/// 等进程真正退出（轮询），返回是否已死
++ (BOOL)waitPidDead:(pid_t)pid timeoutMS:(int)ms;
+/// 结束单个进程；返回「进程确实已经不在了」而不是「信号发出去了」
 + (BOOL)killPid:(pid_t)pid;
 /// 结束整个 App（含子进程）
 + (BOOL)killApp:(NSString *)bundleID pid:(pid_t)pid;
@@ -85,14 +90,19 @@
 - (void)disableForBundle:(NSString *)bundleID;
 - (BOOL)isEnabledForBundle:(NSString *)bundleID;
 - (NSArray<NSString *> *)enabledBundles;
+/// 一键加速用：把「我们挂上去的」保活全撤掉。只 kill 进程而不撤保活，
+/// SpringBoard 会立刻把 App 拉回来，表现就是「加速完了它还在运行」。
+/// 注意：默认保护的名单里本来就含真后台 App，这里只是兜底清理。
++ (void)releaseOwnedBackstage;
 @end
 
 #pragma mark - 一键加速
 
 @interface RBBooster : NSObject
 /// 批量结束后台进程。protect: 不杀的 bundleID（真后台 + 锁定名单）
-/// 返回 @{@"killed", @"failed", @"freedMB", @"beforeMB", @"afterMB",
-///        @"lockedSkipped", @"details", @"lockedNames"}
+/// 返回 @{@"killed", @"failed", @"relaunched", @"freedMB", @"beforeMB", @"afterMB",
+///        @"lockedSkipped", @"lockedKeptMB", @"lockedNames", @"details", @"killedIDs", @"groups"}
+/// killed 只统计「杀完验证确实消失」的；relaunched 是「杀掉了又被系统拉起来」的数量。
 + (NSDictionary *)boostProtecting:(NSSet *)protect;
 /// 可清理候选（按占用内存降序），元素：@{bundleID, pid, mb, estimated}
 + (NSArray<NSDictionary *> *)candidatesProtecting:(NSSet *)protect;

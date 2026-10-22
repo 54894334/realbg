@@ -125,6 +125,51 @@ def ring_mask(cx, cy, r, width, S, ss=3):
     return mask
 
 
+def arc_mask(cx, cy, r, width, a0, a1, S, ss=3):
+    """部分圆环。a0/a1 是角度（度），0 = 12 点方向，顺时针增加。
+    用来画「仪表盘」式的进度环：一段亮、其余暗，视觉上就是「还剩多少」。"""
+    mask = [[0.0] * S for _ in range(S)]
+    lo, hi = r - width / 2.0 - 1, r + width / 2.0 + 1
+    y0, y1 = max(0, int(cy - hi)), min(S, int(cy + hi) + 1)
+    x0, x1 = max(0, int(cx - hi)), min(S, int(cx + hi) + 1)
+    inv = 1.0 / (ss * ss)
+    for y in range(y0, y1):
+        for x in range(x0, x1):
+            hit = 0
+            for sy in range(ss):
+                dy = y + (sy + 0.5) / ss - cy
+                for sx in range(ss):
+                    dx = x + (sx + 0.5) / ss - cx
+                    d = math.hypot(dx, dy)
+                    if not (lo <= d <= hi):
+                        continue
+                    ang = (math.degrees(math.atan2(dx, -dy)) + 360.0) % 360.0
+                    if a0 <= ang <= a1:
+                        hit += 1
+            if hit:
+                mask[y][x] = hit * inv
+    return mask
+
+
+def disc_mask(cx, cy, r, S, ss=3):
+    mask = [[0.0] * S for _ in range(S)]
+    y0, y1 = max(0, int(cy - r - 1)), min(S, int(cy + r) + 2)
+    x0, x1 = max(0, int(cx - r - 1)), min(S, int(cx + r) + 2)
+    inv = 1.0 / (ss * ss)
+    for y in range(y0, y1):
+        for x in range(x0, x1):
+            hit = 0
+            for sy in range(ss):
+                dy = y + (sy + 0.5) / ss - cy
+                for sx in range(ss):
+                    dx = x + (sx + 0.5) / ss - cx
+                    if math.hypot(dx, dy) <= r:
+                        hit += 1
+            if hit:
+                mask[y][x] = hit * inv
+    return mask
+
+
 def round_mask(S, radius, ss=4):
     mask = [[0.0] * S for _ in range(S)]
     inv = 1.0 / (ss * ss)
@@ -218,6 +263,36 @@ def design(name, S=720):
         glow(base, S * 0.5, S * 0.5, S * 0.75, (20, 120, 100), 0.45)
         blend(base, ring_mask(S * 0.5, S * 0.5, S * 0.335, S * 0.052, S), (48, 232, 158, 1))
         blend(base, poly_mask(bolt_pts((0.345, 0.235, 0.665, 0.765), S), S), (255, 255, 255, 1))
+    elif name == "E":    # 仪表环（1.3.0 采用）：进度环 + 玻璃内圆 + 白闪电
+        # 三层结构：底 → 暗环（剩余量）→ 亮弧（已用进度）→ 玻璃内圆 → 闪电。
+        # 比单纯的闪电多一点「这是个能用来看内存的工具」的信息量。
+        base = gradient(S, (13, 30, 31), (4, 9, 11))
+        glow(base, S * 0.5, S * 0.26, S * 0.85, (26, 150, 112), 0.55)
+        glow(base, S * 0.18, S * 0.12, S * 0.60, (190, 255, 230), 0.11)
+
+        cx = cy = S * 0.5
+        r  = S * 0.328
+        wd = S * 0.058
+
+        # 暗环打底：完整一圈，让人看出「这是个表盘」
+        blend(base, ring_mask(cx, cy, r, wd, S), (255, 255, 255, 0.145))
+        # 环的柔光，让亮弧有发光感
+        glow(base, cx, cy, r + wd * 1.7, (28, 170, 120), 0.34)
+        # 亮弧：12 点起顺时针 288°
+        blend(base, arc_mask(cx, cy, r, wd, 0.0, 288.0, S), (46, 226, 158, 1))
+        # 圆弧两端补圆头
+        for ang in (0.0, 288.0):
+            a = math.radians(ang)
+            ex = cx + r * math.sin(a)
+            ey = cy - r * math.cos(a)
+            blend(base, disc_mask(ex, ey, wd / 2.0, S), (46, 226, 158, 1))
+
+        # 玻璃内圆
+        blend(base, disc_mask(cx, cy, S * 0.236, S), (255, 255, 255, 0.07))
+        glow(base, cx, cy, S * 0.31, (40, 150, 116), 0.26)
+
+        # 闪电
+        blend(base, poly_mask(bolt_pts((0.366, 0.264, 0.634, 0.738), S), S), (255, 255, 255, 1))
     else:                # ID：原图标
         raise SystemExit("unknown")
     return base
@@ -346,7 +421,7 @@ if __name__ == "__main__":
 
     os.makedirs(OUT, exist_ok=True)
     variants = {}
-    for v in ("A", "B", "C"):
+    for v in ("A", "B", "C", "E"):
         variants[v] = save_all(v, OUT)
         print("rendered", v)
 

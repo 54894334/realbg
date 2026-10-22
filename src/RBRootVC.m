@@ -27,7 +27,7 @@ static UIColor *RBLock(void)   { return [UIColor colorWithRed:1.00 green:0.78 bl
 @property (nonatomic, strong) UILabel *nameLabel;
 @property (nonatomic, strong) UILabel *bidLabel;
 @property (nonatomic, strong) UILabel *stateLabel;
-@property (nonatomic, strong) UIActivityIndicatorView *spin;
+@property (nonatomic, strong) UIView *dot;
 - (void)bind:(RBAppInfo *)info;
 @end
 
@@ -39,16 +39,20 @@ static UIColor *RBLock(void)   { return [UIColor colorWithRed:1.00 green:0.78 bl
         self.selectionStyle = UITableViewCellSelectionStyleDefault;
 
         UIView *bg = [UIView new];
-        bg.backgroundColor = [UIColor colorWithWhite:1.0 alpha:0.06];
-        bg.layer.cornerRadius = 14;
+        bg.backgroundColor = [UIColor colorWithWhite:1.0 alpha:0.055];
+        bg.layer.cornerRadius = 15;
+        bg.layer.borderWidth = 1.0 / [UIScreen mainScreen].scale;
+        bg.layer.borderColor = [UIColor colorWithWhite:1 alpha:0.06].CGColor;
         self.backgroundView = bg;
         self.selectedBackgroundView = [UIView new];
-        self.selectedBackgroundView.backgroundColor = [UIColor colorWithWhite:1.0 alpha:0.12];
-        self.selectedBackgroundView.layer.cornerRadius = 14;
+        self.selectedBackgroundView.backgroundColor = [UIColor colorWithWhite:1.0 alpha:0.11];
+        self.selectedBackgroundView.layer.cornerRadius = 15;
 
         _iconView2 = [UIImageView new];
-        _iconView2.layer.cornerRadius = 11;
+        _iconView2.layer.cornerRadius = 12;
         _iconView2.layer.masksToBounds = YES;
+        _iconView2.layer.borderWidth = 1.0 / [UIScreen mainScreen].scale;
+        _iconView2.layer.borderColor = [UIColor colorWithWhite:1 alpha:0.10].CGColor;
         _iconView2.contentMode = UIViewContentModeScaleAspectFit;
         [self.contentView addSubview:_iconView2];
 
@@ -58,21 +62,23 @@ static UIColor *RBLock(void)   { return [UIColor colorWithRed:1.00 green:0.78 bl
         [self.contentView addSubview:_nameLabel];
 
         _bidLabel = [UILabel new];
-        _bidLabel.textColor = [UIColor colorWithWhite:1.0 alpha:0.45];
+        _bidLabel.textColor = [UIColor colorWithWhite:1.0 alpha:0.40];
         _bidLabel.font = [UIFont systemFontOfSize:11.5 weight:UIFontWeightRegular];
         _bidLabel.lineBreakMode = NSLineBreakByTruncatingMiddle;
         [self.contentView addSubview:_bidLabel];
 
         _stateLabel = [UILabel new];
         _stateLabel.textColor = RBAccent();
-        _stateLabel.font = [UIFont systemFontOfSize:11 weight:UIFontWeightMedium];
+        _stateLabel.font = [UIFont systemFontOfSize:11.5 weight:UIFontWeightMedium];
         _stateLabel.textAlignment = NSTextAlignmentRight;
         [self.contentView addSubview:_stateLabel];
 
-        _spin = [[UIActivityIndicatorView alloc] initWithActivityIndicatorStyle:UIActivityIndicatorViewStyleMedium];
-        _spin.color = RBAccent();
-        _spin.hidesWhenStopped = YES;
-        [self.contentView addSubview:_spin];
+        // 原来这里是个 UIActivityIndicatorView（转圈）。转圈本身没有「结束」的语义，
+        // 用户看到它一直转会以为进程还在跑 —— 换成实心圆点：绿＝在跑，灰＝没在跑。
+        _dot = [UIView new];
+        _dot.layer.cornerRadius = 3.5;
+        _dot.backgroundColor = RBAccent();
+        [self.contentView addSubview:_dot];
     }
     return self;
 }
@@ -81,14 +87,14 @@ static UIColor *RBLock(void)   { return [UIColor colorWithRed:1.00 green:0.78 bl
     [super layoutSubviews];
     CGFloat h = self.contentView.bounds.size.height;
     CGFloat w = self.contentView.bounds.size.width;
-    _iconView2.frame = CGRectMake(16, (h - 44) / 2.0, 44, 44);
-    CGFloat tx = CGRectGetMaxX(_iconView2.frame) + 12;
-    CGFloat stateW = 104;
-    CGFloat textW = MAX(40, w - tx - stateW - 12);
-    _nameLabel.frame = CGRectMake(tx, h / 2.0 - 20, textW, 22);
-    _bidLabel.frame  = CGRectMake(tx, h / 2.0 + 2, textW, 16);
-    _stateLabel.frame = CGRectMake(w - stateW - 12, h / 2.0 - 9, stateW, 18);
-    _spin.frame = CGRectMake(w - 26, (h - 20) / 2.0, 20, 20);
+    _iconView2.frame = CGRectMake(16, (h - 46) / 2.0, 46, 46);
+    CGFloat tx = CGRectGetMaxX(_iconView2.frame) + 13;
+    CGFloat stateW = 96;
+    CGFloat textW = MAX(40, w - tx - stateW - 26);
+    _nameLabel.frame = CGRectMake(tx, h / 2.0 - 20, textW, 21);
+    _bidLabel.frame  = CGRectMake(tx, h / 2.0 + 1, textW, 16);
+    _stateLabel.frame = CGRectMake(w - stateW - 16, h / 2.0 - 9, stateW, 18);
+    _dot.frame = CGRectMake(w - stateW - 26, (h - 7) / 2.0, 7, 7);
 }
 
 - (void)bind:(RBAppInfo *)info {
@@ -107,20 +113,20 @@ static UIColor *RBLock(void)   { return [UIColor colorWithRed:1.00 green:0.78 bl
     if (tags.count == 0) {
         state = info.isRunning ? @"运行中" : @"未运行";
     } else if (tags.count <= 2) {
-        state = [tags componentsJoinedByString:@"·"];
+        state = [tags componentsJoinedByString:@" · "];
     } else {
         state = [NSString stringWithFormat:@"%@ +%lu", tags[0], (unsigned long)(tags.count - 1)];
     }
     self.stateLabel.text = state;
 
     UIColor *onColor = info.locked ? RBLock() : RBAccent();
-    if (info.isRunning) {
-        self.spin.hidden = NO;
-        [self.spin startAnimating];
-        self.stateLabel.textColor = tags.count ? onColor : [UIColor colorWithWhite:1 alpha:0.45];
+    self.dot.hidden = !info.isRunning;
+    self.dot.backgroundColor = info.locked ? RBLock() : RBAccent();
+    if (tags.count) {
+        self.stateLabel.textColor = onColor;
     } else {
-        [self.spin stopAnimating];
-        self.stateLabel.textColor = tags.count ? onColor : [UIColor colorWithWhite:1 alpha:0.28];
+        self.stateLabel.textColor = info.isRunning ? [UIColor colorWithWhite:1 alpha:0.72]
+                                                   : [UIColor colorWithWhite:1 alpha:0.30];
     }
 }
 
@@ -133,7 +139,16 @@ static UIColor *RBLock(void)   { return [UIColor colorWithRed:1.00 green:0.78 bl
 @property (nonatomic, strong) UISegmentedControl *seg;
 @property (nonatomic, strong) UISearchController *search;
 @property (nonatomic, strong) UIButton *boostButton;
+@property (nonatomic, strong) CAGradientLayer *boostGradient;
 @property (nonatomic, strong) UILabel *memLabel;
+/// 顶部内存卡片
+@property (nonatomic, strong) UIView *memCard;
+@property (nonatomic, strong) UILabel *usedValueLabel;
+@property (nonatomic, strong) UILabel *freeValueLabel;
+@property (nonatomic, strong) UILabel *cleanValueLabel;
+@property (nonatomic, strong) UIView *memBar;
+@property (nonatomic, strong) UIView *memBarFill;
+@property (nonatomic, strong) NSLayoutConstraint *memFillWidth;
 
 @property (nonatomic, strong) NSArray<RBAppInfo *> *allApps;
 @property (nonatomic, strong) NSArray<RBAppInfo *> *shown;
@@ -150,14 +165,24 @@ static UIColor *RBLock(void)   { return [UIColor colorWithRed:1.00 green:0.78 bl
 @property (nonatomic, assign) double freeMB;
 @property (nonatomic, assign) double estimateMB;
 @property (nonatomic, assign) BOOL hasMemory;
+@property (nonatomic, assign) double memRatio;
+@property (nonatomic, assign) NSUInteger lockCount;
+
+/// 每次 reload 领一个号。后台线程回来时如果号已经过时（期间又发起了新的 reload），
+/// 就把这份结果丢掉 —— 否则加速前发起的那次慢枚举会把加速后的状态覆盖回去，
+/// 表现就是「刚加速完，列表又全变成运行中」。
+@property (nonatomic, assign) NSUInteger reloadSeq;
+@property (nonatomic, assign) NSUInteger appliedSeq;
 
 - (void)buildSeg;
+- (void)buildMemCard;
 - (void)buildTable;
 - (void)buildBoost;
 - (void)buildSearch;
 - (void)reload;
 - (void)applyFilter;
 - (void)updateMemoryLabel;
+- (void)layoutMemBar;
 - (void)segChanged;
 - (void)appDidBecomeActive;
 - (void)toggleBackstage:(RBAppInfo *)info;
@@ -165,9 +190,13 @@ static UIColor *RBLock(void)   { return [UIColor colorWithRed:1.00 green:0.78 bl
 - (void)enableAllRunning;
 - (void)tapBoost;
 - (void)doBoostWithCandidates:(NSArray *)cands;
+- (void)applyKilledIDs:(NSArray *)ids;
 - (void)toast:(NSString *)s;
 - (void)presentAlert:(UIAlertController *)ac;
 - (void)reloadAfterDelay;
+- (void)boostPressDown;
+- (void)boostPressUp;
+- (void)setBoostBusy:(BOOL)busy title:(NSString *)title;
 - (void)showMenu;
 - (void)showDiag;
 - (void)promptLastCrashIfAny;
@@ -187,6 +216,7 @@ static UIColor *RBLock(void)   { return [UIColor colorWithRed:1.00 green:0.78 bl
     // 上次启动崩过就先别自动枚举 —— 先保证界面能打开，让用户看到崩溃记录
     self.safeMode = (RBReadLastCrash().length > 0);
 
+    [self buildMemCard];
     [self buildSeg];
     [self buildTable];
     [self buildBoost];
@@ -217,28 +247,154 @@ static UIColor *RBLock(void)   { return [UIColor colorWithRed:1.00 green:0.78 bl
     if (!self.safeMode) [self reload];
 }
 
+- (void)viewDidLayoutSubviews {
+    [super viewDidLayoutSubviews];
+
+    // 渐变层与阴影路径不会自己跟着 Auto Layout 走，必须在布局后手动同步，
+    // 否则旋转 / 首次出现时按钮上半截是空的。
+    if (self.boostGradient) {
+        [CATransaction begin];
+        [CATransaction setDisableActions:YES];
+        self.boostGradient.frame = self.boostButton.bounds;
+        self.boostButton.layer.shadowPath =
+            [UIBezierPath bezierPathWithRoundedRect:self.boostButton.bounds cornerRadius:18].CGPath;
+        [CATransaction commit];
+    }
+    [self layoutMemBar];
+}
+
+- (void)layoutMemBar {
+    CGFloat w = self.memBar.bounds.size.width;
+    if (w <= 0) return;
+    self.memFillWidth.constant = MAX(0, MIN(1.0, self.memRatio)) * w;
+}
+
 - (void)appDidBecomeActive {
     if (!self.safeMode) [self reload];
 }
 
 #pragma mark 布局
 
+- (void)buildMemCard {
+    UIView *card = [UIView new];
+    card.backgroundColor = [UIColor colorWithWhite:1 alpha:0.05];
+    card.layer.cornerRadius = 18;
+    card.layer.borderWidth = 1.0 / [UIScreen mainScreen].scale;
+    card.layer.borderColor = [UIColor colorWithWhite:1 alpha:0.075].CGColor;
+    card.translatesAutoresizingMaskIntoConstraints = NO;
+    [self.view addSubview:card];
+    self.memCard = card;
+
+    NSArray<NSString *> *titles = @[ @"已用", @"可用", @"可清理" ];
+    NSArray<UIColor *> *colors = @[ [UIColor colorWithWhite:1 alpha:0.95], RBAccent(), RBLock() ];
+    NSMutableArray<UILabel *> *vals = [NSMutableArray array];
+    NSMutableArray<UIStackView *> *cols = [NSMutableArray array];
+
+    for (int i = 0; i < 3; i++) {
+        UILabel *t = [UILabel new];
+        t.text = titles[i];
+        t.font = [UIFont systemFontOfSize:11 weight:UIFontWeightMedium];
+        t.textColor = [UIColor colorWithWhite:1 alpha:0.42];
+        t.textAlignment = NSTextAlignmentCenter;
+
+        UILabel *v = [UILabel new];
+        v.text = @"—";
+        v.font = [UIFont monospacedDigitSystemFontOfSize:19 weight:UIFontWeightSemibold];
+        v.textColor = colors[i];
+        v.textAlignment = NSTextAlignmentCenter;
+        v.adjustsFontSizeToFitWidth = YES;
+        v.minimumScaleFactor = 0.7;
+        [vals addObject:v];
+
+        UIStackView *col = [[UIStackView alloc] initWithArrangedSubviews:@[t, v]];
+        col.axis = UILayoutConstraintAxisVertical;
+        col.alignment = UIStackViewAlignmentFill;
+        col.spacing = 1;
+        [cols addObject:col];
+    }
+    self.usedValueLabel  = vals[0];
+    self.freeValueLabel  = vals[1];
+    self.cleanValueLabel = vals[2];
+
+    UIStackView *row = [[UIStackView alloc] initWithArrangedSubviews:cols];
+    row.axis = UILayoutConstraintAxisHorizontal;
+    row.distribution = UIStackViewDistributionFillEqually;
+    row.translatesAutoresizingMaskIntoConstraints = NO;
+    [card addSubview:row];
+
+    // 一条细进度条：已用占比。比纯数字更能一眼看出还剩多少。
+    UIView *bar = [UIView new];
+    bar.backgroundColor = [UIColor colorWithWhite:1 alpha:0.10];
+    bar.layer.cornerRadius = 2.5;
+    bar.translatesAutoresizingMaskIntoConstraints = NO;
+    [card addSubview:bar];
+    self.memBar = bar;
+
+    UIView *fill = [UIView new];
+    fill.backgroundColor = RBAccent();
+    fill.layer.cornerRadius = 2.5;
+    fill.translatesAutoresizingMaskIntoConstraints = NO;
+    [bar addSubview:fill];
+    self.memBarFill = fill;
+    self.memFillWidth = [fill.widthAnchor constraintEqualToConstant:0];
+    [NSLayoutConstraint activateConstraints:@[
+        [fill.leadingAnchor constraintEqualToAnchor:bar.leadingAnchor],
+        [fill.topAnchor constraintEqualToAnchor:bar.topAnchor],
+        [fill.bottomAnchor constraintEqualToAnchor:bar.bottomAnchor],
+        self.memFillWidth,
+    ]];
+
+    UILabel *note = [UILabel new];
+    note.text = @"";
+    note.font = [UIFont systemFontOfSize:11.5];
+    note.textColor = [UIColor colorWithWhite:1 alpha:0.40];
+    note.numberOfLines = 2;
+    note.translatesAutoresizingMaskIntoConstraints = NO;
+    [card addSubview:note];
+    self.memLabel = note;
+
+    [NSLayoutConstraint activateConstraints:@[
+        [card.topAnchor constraintEqualToAnchor:self.view.safeAreaLayoutGuide.topAnchor constant:6],
+        [card.leadingAnchor constraintEqualToAnchor:self.view.leadingAnchor constant:12],
+        [card.trailingAnchor constraintEqualToAnchor:self.view.trailingAnchor constant:-12],
+
+        [row.topAnchor constraintEqualToAnchor:card.topAnchor constant:12],
+        [row.leadingAnchor constraintEqualToAnchor:card.leadingAnchor constant:6],
+        [row.trailingAnchor constraintEqualToAnchor:card.trailingAnchor constant:-6],
+
+        [bar.topAnchor constraintEqualToAnchor:row.bottomAnchor constant:10],
+        [bar.leadingAnchor constraintEqualToAnchor:card.leadingAnchor constant:16],
+        [bar.trailingAnchor constraintEqualToAnchor:card.trailingAnchor constant:-16],
+        [bar.heightAnchor constraintEqualToConstant:5],
+
+        [note.topAnchor constraintEqualToAnchor:bar.bottomAnchor constant:7],
+        [note.leadingAnchor constraintEqualToAnchor:card.leadingAnchor constant:16],
+        [note.trailingAnchor constraintEqualToAnchor:card.trailingAnchor constant:-16],
+        [note.bottomAnchor constraintEqualToAnchor:card.bottomAnchor constant:-11],
+    ]];
+}
+
 - (void)buildSeg {
     self.seg = [[UISegmentedControl alloc] initWithItems:@[@"全部", @"运行", @"保活", @"自启", @"锁定"]];
     self.seg.selectedSegmentIndex = 0;
     if (@available(iOS 13.0, *)) {
-        self.seg.selectedSegmentTintColor = [UIColor colorWithWhite:1 alpha:0.16];
+        self.seg.selectedSegmentTintColor = [UIColor colorWithWhite:1 alpha:0.18];
     }
-    [self.seg setTitleTextAttributes:@{NSForegroundColorAttributeName: [UIColor whiteColor]}
+    self.seg.backgroundColor = [UIColor colorWithWhite:1 alpha:0.06];
+    [self.seg setTitleTextAttributes:@{ NSForegroundColorAttributeName: [UIColor colorWithWhite:1 alpha:0.55],
+                                        NSFontAttributeName: [UIFont systemFontOfSize:12.5 weight:UIFontWeightMedium] }
                              forState:UIControlStateNormal];
+    [self.seg setTitleTextAttributes:@{ NSForegroundColorAttributeName: [UIColor whiteColor],
+                                        NSFontAttributeName: [UIFont systemFontOfSize:12.5 weight:UIFontWeightSemibold] }
+                             forState:UIControlStateSelected];
     [self.seg addTarget:self action:@selector(segChanged) forControlEvents:UIControlEventValueChanged];
     self.seg.translatesAutoresizingMaskIntoConstraints = NO;
     [self.view addSubview:self.seg];
     [NSLayoutConstraint activateConstraints:@[
-        [self.seg.topAnchor constraintEqualToAnchor:self.view.safeAreaLayoutGuide.topAnchor constant:8],
+        [self.seg.topAnchor constraintEqualToAnchor:self.memCard.bottomAnchor constant:10],
         [self.seg.leadingAnchor constraintEqualToAnchor:self.view.leadingAnchor constant:12],
         [self.seg.trailingAnchor constraintEqualToAnchor:self.view.trailingAnchor constant:-12],
-        [self.seg.heightAnchor constraintEqualToConstant:32],
+        [self.seg.heightAnchor constraintEqualToConstant:33],
     ]];
 }
 
@@ -246,10 +402,10 @@ static UIColor *RBLock(void)   { return [UIColor colorWithRed:1.00 green:0.78 bl
     self.tableView = [[UITableView alloc] initWithFrame:CGRectZero style:UITableViewStylePlain];
     self.tableView.backgroundColor = [UIColor clearColor];
     self.tableView.separatorStyle = UITableViewCellSeparatorStyleNone;
-    self.tableView.rowHeight = 68;
+    self.tableView.rowHeight = 72;
     self.tableView.dataSource = self;
     self.tableView.delegate = self;
-    self.tableView.contentInset = UIEdgeInsetsMake(6, 0, 96, 0);
+    self.tableView.contentInset = UIEdgeInsetsMake(4, 0, 104, 0);
     self.tableView.keyboardDismissMode = UIScrollViewKeyboardDismissModeOnDrag;
     [self.tableView registerClass:[RBAppCell class] forCellReuseIdentifier:@"cell"];
     self.tableView.translatesAutoresizingMaskIntoConstraints = NO;
@@ -258,44 +414,71 @@ static UIColor *RBLock(void)   { return [UIColor colorWithRed:1.00 green:0.78 bl
 
 - (void)buildBoost {
     UIView *bar = [UIView new];
-    bar.backgroundColor = [UIColor colorWithWhite:0.08 alpha:0.96];
+    bar.backgroundColor = [UIColor colorWithWhite:0.045 alpha:0.97];
     bar.translatesAutoresizingMaskIntoConstraints = NO;
     [self.view addSubview:bar];
 
-    self.memLabel = [UILabel new];
-    self.memLabel.textColor = [UIColor colorWithWhite:1 alpha:0.6];
-    self.memLabel.font = [UIFont systemFontOfSize:12];
-    self.memLabel.numberOfLines = 2;
-    self.memLabel.text = @"正在读取内存…";
-    self.memLabel.translatesAutoresizingMaskIntoConstraints = NO;
-    [bar addSubview:self.memLabel];
+    UIView *hair = [UIView new];
+    hair.backgroundColor = [UIColor colorWithWhite:1 alpha:0.07];
+    hair.translatesAutoresizingMaskIntoConstraints = NO;
+    [bar addSubview:hair];
 
-    self.boostButton = [UIButton buttonWithType:UIButtonTypeSystem];
+    self.boostButton = [UIButton buttonWithType:UIButtonTypeCustom];
     [self.boostButton setTitle:@"一键加速" forState:UIControlStateNormal];
-    [self.boostButton setTitleColor:[UIColor blackColor] forState:UIControlStateNormal];
-    self.boostButton.titleLabel.font = [UIFont systemFontOfSize:17 weight:UIFontWeightBold];
-    self.boostButton.backgroundColor = RBAccent();
-    self.boostButton.layer.cornerRadius = 16;
+    [self.boostButton setTitleColor:[UIColor whiteColor] forState:UIControlStateNormal];
+    [self.boostButton setTitleColor:[UIColor colorWithWhite:1 alpha:0.62] forState:UIControlStateDisabled];
+    self.boostButton.titleLabel.font = [UIFont systemFontOfSize:17.5 weight:UIFontWeightBold];
+    self.boostButton.layer.cornerRadius = 18;
+    // 渐变放在子 layer 里、自己裁圆角，外层就能保留外发光
+    // （masksToBounds = YES 会把 shadow 一起裁掉，所以不能靠它裁背景图）
+    CAGradientLayer *g = [CAGradientLayer layer];
+    g.colors = @[ (id)[UIColor colorWithRed:0.20 green:0.84 blue:0.60 alpha:1].CGColor,
+                  (id)[UIColor colorWithRed:0.08 green:0.64 blue:0.49 alpha:1].CGColor ];
+    g.startPoint = CGPointMake(0.5, 0.0);
+    g.endPoint   = CGPointMake(0.5, 1.0);
+    g.cornerRadius = 18;
+    [self.boostButton.layer insertSublayer:g atIndex:0];
+    self.boostGradient = g;
+    self.boostButton.layer.shadowColor = [UIColor colorWithRed:0.10 green:0.80 blue:0.55 alpha:0.40].CGColor;
+    self.boostButton.layer.shadowOpacity = 1;
+    self.boostButton.layer.shadowRadius = 14;
+    self.boostButton.layer.shadowOffset = CGSizeMake(0, 5);
     [self.boostButton addTarget:self action:@selector(tapBoost) forControlEvents:UIControlEventTouchUpInside];
+    [self.boostButton addTarget:self action:@selector(boostPressDown) forControlEvents:UIControlEventTouchDown];
+    [self.boostButton addTarget:self action:@selector(boostPressUp)
+               forControlEvents:UIControlEventTouchUpInside | UIControlEventTouchUpOutside | UIControlEventTouchCancel];
     self.boostButton.translatesAutoresizingMaskIntoConstraints = NO;
     [bar addSubview:self.boostButton];
+
+    UILabel *hint = [UILabel new];
+    hint.text = @"只结束没锁定的后台 App · 真后台与锁定项一律保留";
+    hint.font = [UIFont systemFontOfSize:10.5];
+    hint.textColor = [UIColor colorWithWhite:1 alpha:0.32];
+    hint.textAlignment = NSTextAlignmentCenter;
+    hint.translatesAutoresizingMaskIntoConstraints = NO;
+    [bar addSubview:hint];
 
     [NSLayoutConstraint activateConstraints:@[
         [bar.leadingAnchor constraintEqualToAnchor:self.view.leadingAnchor],
         [bar.trailingAnchor constraintEqualToAnchor:self.view.trailingAnchor],
         [bar.bottomAnchor constraintEqualToAnchor:self.view.bottomAnchor],
 
-        [self.memLabel.topAnchor constraintEqualToAnchor:bar.topAnchor constant:8],
-        [self.memLabel.leadingAnchor constraintEqualToAnchor:bar.leadingAnchor constant:20],
-        [self.memLabel.trailingAnchor constraintEqualToAnchor:bar.trailingAnchor constant:-20],
+        [hair.topAnchor constraintEqualToAnchor:bar.topAnchor],
+        [hair.leadingAnchor constraintEqualToAnchor:bar.leadingAnchor],
+        [hair.trailingAnchor constraintEqualToAnchor:bar.trailingAnchor],
+        [hair.heightAnchor constraintEqualToConstant:1.0 / [UIScreen mainScreen].scale],
 
-        [self.boostButton.topAnchor constraintEqualToAnchor:self.memLabel.bottomAnchor constant:6],
+        [self.boostButton.topAnchor constraintEqualToAnchor:bar.topAnchor constant:10],
         [self.boostButton.leadingAnchor constraintEqualToAnchor:bar.leadingAnchor constant:16],
         [self.boostButton.trailingAnchor constraintEqualToAnchor:bar.trailingAnchor constant:-16],
-        [self.boostButton.heightAnchor constraintEqualToConstant:50],
-        [self.boostButton.bottomAnchor constraintEqualToAnchor:bar.safeAreaLayoutGuide.bottomAnchor constant:-8],
+        [self.boostButton.heightAnchor constraintEqualToConstant:52],
 
-        [self.tableView.topAnchor constraintEqualToAnchor:self.seg.bottomAnchor constant:8],
+        [hint.topAnchor constraintEqualToAnchor:self.boostButton.bottomAnchor constant:7],
+        [hint.leadingAnchor constraintEqualToAnchor:bar.leadingAnchor constant:16],
+        [hint.trailingAnchor constraintEqualToAnchor:bar.trailingAnchor constant:-16],
+        [hint.bottomAnchor constraintEqualToAnchor:bar.safeAreaLayoutGuide.bottomAnchor constant:-6],
+
+        [self.tableView.topAnchor constraintEqualToAnchor:self.seg.bottomAnchor constant:6],
         [self.tableView.leadingAnchor constraintEqualToAnchor:self.view.leadingAnchor],
         [self.tableView.trailingAnchor constraintEqualToAnchor:self.view.trailingAnchor],
         [self.tableView.bottomAnchor constraintEqualToAnchor:bar.topAnchor],
@@ -322,6 +505,7 @@ static UIColor *RBLock(void)   { return [UIColor colorWithRed:1.00 green:0.78 bl
         return;
     }
     self.loading = YES;
+    NSUInteger seq = ++self.reloadSeq;
 
     dispatch_async(dispatch_get_global_queue(QOS_CLASS_USER_INITIATED, 0), ^{
         NSArray *apps = [RBProcesses installedApps];
@@ -351,20 +535,25 @@ static UIColor *RBLock(void)   { return [UIColor colorWithRed:1.00 green:0.78 bl
         NSUInteger lockCount = store.lockIDs.count;
 
         dispatch_async(dispatch_get_main_queue(), ^{
+            self.loading = NO;
+
+            // 结果过期就整份丢掉：期间已经发起了更新的 reload（或加速刚就地改过状态），
+            // 这份慢枚举拿到的是加速之前的进程表，写进去就把界面拉回旧状态。
+            if (seq < self.appliedSeq) {
+                if (self.pendingReload) { self.pendingReload = NO; [self reload]; }
+                return;
+            }
+            self.appliedSeq = seq;
+
             self.allApps = [apps copy];
             self.usedMB = used;
             self.freeMB = freeMB;
             self.estimateMB = est;
             self.hasMemory = hasMemory;
-            self.loading = NO;
+            self.lockCount = lockCount;
             if (apps.count > 0) self.safeMode = NO;    // 枚举成功就退出安全模式
             [self applyFilter];
             [self updateMemoryLabel];
-
-            if (lockCount > 0) {
-                self.memLabel.text = [self.memLabel.text stringByAppendingFormat:@" · 锁定 %lu",
-                                      (unsigned long)lockCount];
-            }
 
             if (self.pendingReload) {
                 self.pendingReload = NO;
@@ -395,11 +584,49 @@ static UIColor *RBLock(void)   { return [UIColor colorWithRed:1.00 green:0.78 bl
 
 - (void)updateMemoryLabel {
     if (!self.hasMemory) {
-        if (!self.safeMode) self.memLabel.text = @"内存信息读取失败";
+        self.usedValueLabel.text  = @"—";
+        self.freeValueLabel.text  = @"—";
+        self.cleanValueLabel.text = @"—";
+        self.memRatio = 0;
+        self.memLabel.text = self.safeMode
+            ? @"上次启动异常，已进入安全模式 · 点右上「刷新」重试"
+            : @"内存信息读取失败";
+        [self layoutMemBar];
         return;
     }
-    self.memLabel.text = [NSString stringWithFormat:@"已用 %@ · 可用 %@ · 可清理约 %@",
-                          RBHumanMB(self.usedMB), RBHumanMB(self.freeMB), RBHumanMB(self.estimateMB)];
+
+    self.usedValueLabel.text  = RBHumanMB(self.usedMB);
+    self.freeValueLabel.text  = RBHumanMB(self.freeMB);
+    self.cleanValueLabel.text = self.estimateMB > 0.5 ? RBHumanMB(self.estimateMB) : @"0";
+
+    double total = self.usedMB + self.freeMB;
+    self.memRatio = total > 1.0 ? (self.usedMB / total) : 0;
+
+    NSMutableString *note = [NSMutableString string];
+    [note appendFormat:@"已用 %.0f%% · 共 %@", self.memRatio * 100.0, RBHumanMB(total)];
+    if (self.lockCount > 0) {
+        [note appendFormat:@" · 已锁定 %lu 个", (unsigned long)self.lockCount];
+    }
+    self.memLabel.text = note;
+    [self layoutMemBar];
+}
+
+/// 加速完成后立刻把「已确认结束」的 App 就地标记成未运行。
+/// 不等后台重新枚举 —— 一次完整枚举要扫全部安装包并解图标，几秒钟内界面还是旧状态，
+/// 用户就会觉得「加速了但它还在运行」。真实状态随后由 reload 校正。
+- (void)applyKilledIDs:(NSArray *)ids {
+    if (ids.count == 0) return;
+    NSSet *set = [NSSet setWithArray:ids];
+    for (RBAppInfo *i in self.allApps) {
+        if ([set containsObject:i.bundleID]) {
+            i.isRunning = NO;
+            i.pid = 0;
+        }
+    }
+    // 让所有在飞的 reload 作废，避免它们带着杀之前的数据覆盖回来
+    self.appliedSeq = ++self.reloadSeq;
+    [self applyFilter];
+    [self updateMemoryLabel];
 }
 
 - (void)reloadAfterDelay {
@@ -607,26 +834,47 @@ static UIColor *RBLock(void)   { return [UIColor colorWithRed:1.00 green:0.78 bl
     [self reload];
 }
 
+- (void)setBoostBusy:(BOOL)busy title:(NSString *)title {
+    self.boostBusy = busy;
+    self.boostButton.enabled = !busy;
+    self.boostButton.alpha = busy ? 0.72 : 1.0;
+    [self.boostButton setTitle:title forState:UIControlStateNormal];
+}
+
+- (void)boostPressDown {
+    [UIView animateWithDuration:0.12 delay:0 options:UIViewAnimationOptionCurveEaseOut animations:^{
+        self.boostButton.transform = CGAffineTransformMakeScale(0.975, 0.975);
+    } completion:nil];
+}
+
+- (void)boostPressUp {
+    [UIView animateWithDuration:0.28 delay:0 usingSpringWithDamping:0.58 initialSpringVelocity:0.5
+                        options:UIViewAnimationOptionCurveEaseOut animations:^{
+        self.boostButton.transform = CGAffineTransformIdentity;
+    } completion:nil];
+}
+
+- (NSDictionary<NSString *, NSString *> *)nameMap {
+    NSMutableDictionary<NSString *, NSString *> *m = [NSMutableDictionary dictionary];
+    for (RBAppInfo *i in self.allApps) {
+        if (i.bundleID.length) m[i.bundleID] = i.name ?: i.bundleID;
+    }
+    return m;
+}
+
 - (void)tapBoost {
     if (self.boostBusy) return;
-    self.boostBusy = YES;
-    self.boostButton.enabled = NO;
-    [self.boostButton setTitle:@"正在统计…" forState:UIControlStateNormal];
+    [self setBoostBusy:YES title:@"正在统计…"];
 
     NSSet *protect = [[RBStore shared] allProtectedIDs];
     dispatch_async(dispatch_get_global_queue(QOS_CLASS_USER_INITIATED, 0), ^{
         NSArray *cands = [RBBooster candidatesProtecting:protect];
         NSArray *locked = [RBBooster lockedCandidatesProtecting:protect];
         dispatch_async(dispatch_get_main_queue(), ^{
-            self.boostBusy = NO;
-            self.boostButton.enabled = YES;
-            [self.boostButton setTitle:@"一键加速" forState:UIControlStateNormal];
+            [self setBoostBusy:NO title:@"一键加速"];
 
             // 锁定项的名字要换成 App 显示名，bundleID 对普通用户没意义
-            NSMutableDictionary<NSString *, NSString *> *nameMap = [NSMutableDictionary dictionary];
-            for (RBAppInfo *i in self.allApps) {
-                if (i.bundleID.length) nameMap[i.bundleID] = i.name ?: i.bundleID;
-            }
+            NSDictionary *nameMap = [self nameMap];
 
             NSMutableString *lockLine = [NSMutableString string];
             if (locked.count > 0) {
@@ -645,10 +893,28 @@ static UIColor *RBLock(void)   { return [UIColor colorWithRed:1.00 green:0.78 bl
             }
 
             if (cands.count == 0) {
-                NSString *msg = lockLine.length
-                    ? [lockLine stringByAppendingString:@"除此之外没有可清理的后台进程。"]
-                    : @"没有可清理的后台进程（系统 App、8MB 以下的不动）。";
-                UIAlertController *ac = [UIAlertController alertControllerWithTitle:@"无需加速"
+                // 说清「为什么没有」——这个 App 是否在跑、跑着为什么不算可清理，
+                // 都比干巴巴一句「无需加速」有用。
+                NSUInteger aliveOthers = 0;
+                for (RBAppInfo *i in self.allApps) {
+                    if (i.isRunning && !i.isSystem) aliveOthers++;
+                }
+                NSString *msg = nil;
+                if (lockLine.length) {
+                    msg = [lockLine stringByAppendingString:
+                           (aliveOthers > 0
+                            ? [NSString stringWithFormat:@"其余 %lu 个后台占用都很小（不足 8MB），清理收益可以忽略。",
+                               (unsigned long)aliveOthers]
+                            : @"除此之外没有可清理的后台进程。")];
+                } else if (aliveOthers > 0) {
+                    msg = [NSString stringWithFormat:
+                           @"后台有 %lu 个 App 在跑，但每个占用都不到 8MB。\n"
+                           @"这点内存清掉也不会变快，系统随时会自己回收。",
+                           (unsigned long)aliveOthers];
+                } else {
+                    msg = @"当前没有第三方 App 在后台运行。\n系统 App 不在清理范围内。";
+                }
+                UIAlertController *ac = [UIAlertController alertControllerWithTitle:@"不需要加速"
                                                                            message:msg
                                                                     preferredStyle:UIAlertControllerStyleAlert];
                 [ac addAction:[UIAlertAction actionWithTitle:@"好" style:UIAlertActionStyleDefault handler:nil]];
@@ -688,35 +954,65 @@ static UIColor *RBLock(void)   { return [UIColor colorWithRed:1.00 green:0.78 bl
 }
 
 - (void)doBoostWithCandidates:(NSArray *)cands {
-    self.boostBusy = YES;
-    self.boostButton.enabled = NO;
-    [self.boostButton setTitle:@"正在加速…" forState:UIControlStateNormal];
+    [self setBoostBusy:YES title:@"正在加速…"];
 
     NSSet *protect = [[RBStore shared] allProtectedIDs];
     dispatch_async(dispatch_get_global_queue(QOS_CLASS_USER_INITIATED, 0), ^{
         NSDictionary *r = [RBBooster boostProtecting:protect];
         dispatch_async(dispatch_get_main_queue(), ^{
-            self.boostBusy = NO;
-            self.boostButton.enabled = YES;
-            [self.boostButton setTitle:@"一键加速" forState:UIControlStateNormal];
+            [self setBoostBusy:NO title:@"一键加速"];
 
-            NSMutableString *msg = [NSMutableString stringWithFormat:
-                @"结束 %@ 个进程\n释放 %@（可用 %@ → %@）\n失败 %@ 个",
-                r[@"killed"], RBHumanMB([r[@"freedMB"] doubleValue]),
-                RBHumanMB([r[@"beforeMB"] doubleValue]),
-                RBHumanMB([r[@"afterMB"] doubleValue]), r[@"failed"]];
+            NSUInteger killed = [r[@"killed"] unsignedIntegerValue];
+            NSUInteger failed = [r[@"failed"] unsignedIntegerValue];
+            NSUInteger relau  = [r[@"relaunched"] unsignedIntegerValue];
+            NSUInteger rounds = [r[@"rounds"] unsignedIntegerValue];
+            double freed    = [r[@"freedMB"] doubleValue];
+            double byKill   = [r[@"freedByKillMB"] doubleValue];
+            double afterUsed = [r[@"afterUsedMB"] doubleValue];
+            double afterFree = [r[@"afterMB"] doubleValue];
+
+            // 实测下降量可能为 0（系统还没回收完页面），这时退回「被杀进程占用之和」，
+            // 但文案上标成「≈」，不假装是实测值。
+            NSString *freedText;
+            if (freed >= 1.0) {
+                freedText = [NSString stringWithFormat:@"已用内存下降 %@", RBHumanMB(freed)];
+            } else if (byKill >= 1.0) {
+                freedText = [NSString stringWithFormat:@"结束进程共占 ≈%@（系统稍后回收）", RBHumanMB(byKill)];
+            } else {
+                freedText = @"已用内存没有明显变化";
+            }
+
+            NSMutableString *msg = [NSMutableString string];
+            [msg appendFormat:@"结束 %lu 个后台进程", (unsigned long)killed];
+            if (relau > 0) {
+                [msg appendFormat:@"（其中 %lu 个被系统重新拉起，已清 %lu 轮）",
+                 (unsigned long)relau, (unsigned long)rounds];
+            }
+            [msg appendFormat:@"\n%@\n现在已用 %@ · 可用 %@", freedText,
+             RBHumanMB(afterUsed), RBHumanMB(afterFree)];
+
+            if (failed > 0) {
+                [msg appendFormat:@"\n\n有 %lu 个结束不了（系统拒绝或已被托管），已跳过。", (unsigned long)failed];
+            }
 
             NSUInteger lockedSkipped = [r[@"lockedSkipped"] unsignedIntegerValue];
             if (lockedSkipped > 0) {
-                [msg appendFormat:@"\n\n🔒 锁定保留 %lu 个（约 %@），没有被碰",
+                [msg appendFormat:@"\n\n🔒 锁定保留 %lu 个（约 %@），没有被碰。",
                  (unsigned long)lockedSkipped, RBHumanMB([r[@"lockedKeptMB"] doubleValue])];
             }
 
-            UIAlertController *ac = [UIAlertController alertControllerWithTitle:@"加速完成"
+            NSString *title = killed > 0 ? @"加速完成" : @"没能结束任何进程";
+
+            // 先就地把状态改掉再弹窗：用户关掉弹窗看到的列表必须已经是新的
+            [self applyKilledIDs:r[@"killedIDs"]];
+
+            UIAlertController *ac = [UIAlertController alertControllerWithTitle:title
                                                                        message:msg
                                                                 preferredStyle:UIAlertControllerStyleAlert];
             [ac addAction:[UIAlertAction actionWithTitle:@"好" style:UIAlertActionStyleDefault handler:nil]];
             [self presentAlert:ac];
+
+            // 再让后台重新枚举一遍，把「被重新拉起」的真实情况校正回来
             [self reload];
         });
     });

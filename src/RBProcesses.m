@@ -423,15 +423,76 @@ static BOOL RBKillViaRunningBoard(pid_t pid) {
     }
 }
 
++ (BOOL)isPidAlive:(pid_t)pid {
+    if (pid <= 0) return NO;
+    if (kill(pid, 0) != 0 && errno != EPERM) return NO;
+
+    // kill(pid,0) 成功只说明「这个 pid 号存在」，僵尸进程一样会成功。
+    // 僵尸进程已经死了、只是还没被父进程回收，占着内存为 0，不该当成「还在运行」。
+    // proc_pidpath 对僵尸返回 <=0，是最省事的区分方式。
+    char path[PROC_PIDPATHINFO_MAXSIZE];
+    memset(path, 0, sizeof(path));
+    return proc_pidpath(pid, path, sizeof(path)) > 0;
+}
+
++ (BOOL)waitPidDead:(pid_t)pid timeoutMS:(int)ms {
+    if (pid <= 0) return YES;
+    int waited = 0;
+    while (waited < ms) {
+        if (![self isPidAlive:pid]) return YES;
+        usleep(20 * 1000);
+        waited += 20;
+    }
+    return ![self isPidAlive:pid];
+}
+
 + (BOOL)killPid:(pid_t)pid {
     if (pid <= 1) return NO;
     if (pid == getpid()) return NO;
 
-    if (kill(pid, SIGKILL) == 0) return YES;
-    // 没有权限时退回 SIGTERM（个别进程只吃 TERM）
-    if (errno == EPERM && kill(pid, SIGTERM) == 0) return YES;
-    // 两条信号都不行，走 RunningBoard
-    return RBKillViaRunningBoard(pid);
+    // 1.2.x 的写法是「kill() 返回 0 就当成功」。这是错的 ——
+    // kill() 只是把信号投出去，返回值只代表「信号没被内核拒收」。
+    // 现象就是：界面报「结束 5 个」，实际一个都没死。
+    // 现在每一步都回读进程表，只有真的消失了才算成功。
+    if (![self isPidAlive:pid]) return YES;              // 已经退出了，视为成功
+
+    kill(pid, SIGKILL);
+    if ([self waitPidDead:pid timeoutMS:240]) return YES;
+
+    // 少数被 RunningBoard 托管的进程会忽略 SIGKILL 直到它自己的看门狗处理，
+    // 补一次 SIGTERM 让它走正常退出路径。
+    kill(pid, SIGTERM);
+    if ([self waitPidDead:pid timeoutMS:200]) return YES;
+
+    // 两条信号都没解决，走 FrontBoard / RunningBoard 的正规终止
+    (void)RBKillViaRunningBoard(pid);
+    if ([self waitPidDead:pid timeoutMS:400]) return YES;
+
+    return ![self isPidAlive:pid];
+}
+
+/// FrontBoard 的「关闭应用」路径。这是 SpringBoard 结束 App 自己走的那条，
+/// 比 kill() 多一步：它会同时把 scene 从 FrontBoard 摘掉，所以进程不会被立刻拉起。
+static void RBKillViaFrontBoard(NSString *bundleID) {
+    Class svcCls = NSClassFromString(@"FBSSystemService");
+    if (!svcCls) return;
+    @try {
+        id svc = nil;
+        SEL sShared = NSSelectorFromString(@"sharedService");
+        if ([svcCls respondsToSelector:sShared]) {
+            svc = ((id (*)(id, SEL))objc_msgSend)(svcCls, sShared);
+        }
+        if (!svc) svc = ((id (*)(id, SEL))objc_msgSend)(
+            ((id (*)(id, SEL))objc_msgSend)(svcCls, @selector(alloc)), @selector(init));
+        if (!svc) return;
+
+        SEL sTerm = NSSelectorFromString(@"terminateApplication:forReason:andReport:withDescription:");
+        if (![svc respondsToSelector:sTerm]) return;
+        ((void (*)(id, SEL, id, int, BOOL, id))objc_msgSend)(
+            svc, sTerm, bundleID, 0 /* 正常退出 */, NO, @"RealBG 一键加速");
+    } @catch (NSException *e) {
+        RBLog(@"FBSSystemService 终止失败（%@）：%@", bundleID, e.reason);
+    }
 }
 
 + (BOOL)killApp:(NSString *)bundleID pid:(pid_t)pid {
@@ -449,7 +510,17 @@ static BOOL RBKillViaRunningBoard(pid_t pid) {
         RBLog(@"pid %d 已被 %@ 复用，跳过 %@", pid, now, bundleID);
         return NO;
     }
-    return [self killPid:pid];
+
+    if ([self killPid:pid]) return YES;
+
+    // 信号杀不掉（进程被 RunningBoard 托管 / 跨 uid）时，改用 FrontBoard 按
+    // bundleID 终止 —— 这是 SpringBoard 自己关 App 走的那条路，它还会顺手
+    // 把这个 App 的 scene 收掉，不容易被立刻拉起来。
+    if (bundleID.length) {
+        RBKillViaFrontBoard(bundleID);
+        if ([self waitPidDead:pid timeoutMS:500]) return YES;
+    }
+    return ![self isPidAlive:pid];
 }
 
 + (BOOL)isSystemBundle:(NSString *)bundleID { return RBIsSystemBundle(bundleID); }

@@ -383,4 +383,15 @@ static void RBInstallSceneWindowHooksIfNeeded(void) {
     return s.allObjects;
 }
 
++ (void)releaseOwnedBackstage {
+    RBBackstage *bs = [RBBackstage shared];
+    NSArray *own = [bs enabledBundles];
+    for (NSString *bid in own) {
+        @autoreleasepool {
+            [bs disableForBundle:bid];
+        }
+    }
+    if (own.count) RBLog(@"已撤销 %lu 个自挂保活", (unsigned long)own.count);
+}
+
 @end

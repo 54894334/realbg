@@ -90,26 +90,35 @@ check(len(bundles) >= 25, "系统应用名单条数 >= 25", "（实际 %d）" % 
 print("\n== 2. 杀进程守卫 ==")
 check("if (pid <= 1) return NO;" in proc, "拒绝 pid<=1（内核/launchd）")
 check("if (pid == getpid()) return NO;" in proc, "拒绝杀自己")
-check("kill(pid, SIGTERM) == 0" in proc, "无权限时降级 SIGTERM 而非强杀")
+check("kill(pid, SIGTERM);" in proc and "waitPidDead" in proc,
+      "SIGKILL 无效时降级 SIGTERM 并轮询确认死亡（不是发出去就算完）")
+check("if (![self isPidAlive:pid]) return YES;" in proc,
+      "kill() 返回 0 不再当成成功（它只代表信号没被内核拒收）")
 check("[RBProtectedBundleIDs() containsObject:bundleID]" in strip_comments(proc), "killApp: 再拦一次系统 App")
 clean_proc = strip_comments(proc)
 check("RBIsSystemBundle" in clean_proc and 'hasPrefix:@"com.apple."' in clean_proc,
       "系统 App 按 com.apple. 前缀整片拦（不依赖清单是否写全）")
 check("RBKillViaRunningBoard" in clean_proc and "terminateWithExplanation:" in clean_proc,
       "kill 失败时走 RunningBoard 正规终止")
+check("RBKillViaFrontBoard" in clean_proc
+      and "terminateApplication:forReason:andReport:withDescription:" in clean_proc,
+      "还有 FrontBoard 按 bundleID 终止（会顺手收掉 scene，不容易被立刻拉起）")
 check("[now isEqualToString:bundleID]" in clean_proc, "杀之前校验 pid 仍属于同一 bundle（防 pid 复用误杀）")
 
 print("\n== 3. 一键加速过滤规则（用真实名单 + 真实阈值做判定） ==")
 boost = read("RBBooster.m")
-m = re.search(r"if \(mb < (\d+)\) continue", boost)
-thresh = int(m.group(1)) if m else None
-check(thresh == 8, "跳过占用 < 8MB 的进程", "（源码阈值 %s）" % thresh)
-check('if (exclude && [exclude containsObject:bid]) continue;' in boost, "真后台/锁定名单在候选阶段就排除")
-check('if ([protectedBundles containsObject:bid]) continue;' in boost, "系统应用不杀")
-check('if ([RBProcesses isSystemBundle:bid]) continue;' in boost, "com.apple.* 在候选阶段就被排除")
-check('if (pid <= 0 || pid == me) continue;' in boost, "跳过非法 pid 与自身")
-check("usleep(600 * 1000)" in boost, "杀完等待 600ms 再读内存（避免读到旧值）")
-check("ri_phys_footprint" in boost, "单进程占用用 phys_footprint（真实值）")
+boost_code = strip_comments(boost)
+m = re.search(r"RBMinWorthMB\s*=\s*([\d.]+)", boost_code)
+thresh = float(m.group(1)) if m else None
+check(thresh == 8.0, "跳过占用 < 8MB 的进程", "（源码阈值 %s）" % thresh)
+check("if (protect && [protect containsObject:bid]) return NO;" in boost_code,
+      "真后台/锁定名单在候选阶段就排除")
+check("if ([sysNames containsObject:bid]) return NO;" in boost_code, "系统应用不杀")
+check("if ([RBProcesses isSystemBundle:bid]) return NO;" in boost_code,
+      "com.apple.* 在候选阶段就被排除")
+check("if (pid <= 0 || pid == getpid()) return NO;" in boost_code, "跳过非法 pid 与自身")
+check("usleep(500 * 1000)" in boost_code, "杀完等待 500ms 再读内存（避免读到旧值）")
+check("ri_phys_footprint" in boost_code, "单进程占用用 phys_footprint（真实值）")
 
 # 模拟：给一张混合进程表，跑一遍过滤
 procs = [
@@ -296,7 +305,7 @@ check("<key>UIRequiresFullScreen</key>" not in ipl,
       "去掉 UIRequiresFullScreen（iPad 上强制四方向，只声明竖屏会断言崩溃）")
 check("UISupportedInterfaceOrientations~ipad" in ipl, "iPad 单独声明四个方向")
 check("LSSupportsOpeningDocumentsInPlace" in ipl, "文件 App 可直接打开日志目录")
-check("<string>1.2.0</string>" in ipl, "Info.plist 版本 1.2.0")
+check("<string>1.3.0</string>" in ipl, "Info.plist 版本 1.3.0")
 
 print("\n== 12. 1.2.0：消除「点开秒退」的全部已知成因 ==")
 mk_code = "\n".join(l.split("#")[0] for l in mk.split("\n"))
@@ -390,6 +399,63 @@ check(not not_built, "Makefile 的 RealBG_FILES 收录了 src 下全部 %d 个 .
 # 反转：链接器不允许再被放开
 check("dynamic_lookup" not in mk_code,
       "仍然不允许 dynamic_lookup（它就是让上面这些问题一直没被发现的元凶）")
+
+print("\n== 14. 1.3.0：加速真的杀掉了，界面也真的跟着变 ==")
+# 三个现场问题：
+#   ① 加速后目标仍在「运行中」列表里            → kill() 返回值 ≠ 进程已死
+#   ② 再点一键加速却说「无需加速」              → 复活进程占用小，被 8MB 门槛漏掉
+#   ③ 列表一直转圈                              → reload 数据被旧结果覆盖 / 转圈语义不清
+
+pr_c = strip_comments(root_src["RBProcesses.m"])
+_ia = pr_c.index("+ (BOOL)isPidAlive:(pid_t)pid {")
+check("proc_pidpath(pid, path, sizeof(path)) > 0" in pr_c[_ia:_ia + 900],
+      "存活判定加 proc_pidpath：僵尸进程 kill(pid,0) 也回 0，不能算活着")
+check("+ (BOOL)waitPidDead:(pid_t)pid timeoutMS:(int)ms" in pr_c,
+      "有 waitPidDead：发完信号要轮询等它真的消失")
+_bp = pr_c[pr_c.index("+ (BOOL)killPid:(pid_t)pid {"):]
+_bp = _bp[:_bp.index("+ (BOOL)killApp:")]
+check("return ![self isPidAlive:pid];" in _bp, "killPid 最终以进程表为准，不以 errno 为准")
+check(_bp.index("SIGKILL") < _bp.index("SIGTERM") < _bp.index("RBKillViaRunningBoard"),
+      "升级路径顺序：SIGKILL → SIGTERM → RunningBoard")
+
+bo_c = strip_comments(root_src["RBBooster.m"])
+check("RBMaxRounds" in bo_c and "for (int round = 0; round < RBMaxRounds; round++)" in bo_c,
+      "多轮清场：进程被杀后 SpringBoard 会重新拉起，一轮不够")
+check("+ (NSArray<NSDictionary *> *)revivedFrom:(NSSet *)killedIDs" in bo_c,
+      "复扫只盯「刚才杀过、现在又活了」的")
+_rv = bo_c[bo_c.index("+ (NSArray<NSDictionary *> *)revivedFrom:"):]
+_rv = _rv[:_rv.index("+ (NSDictionary *)boostProtecting:")]
+check("RBMinWorthMB" not in _rv,
+      "复扫不设 8MB 门槛（复活初期占用很小，设门槛就会「列表还在跑但说无需加速」）")
+check("NSDictionary *finalRunning = [RBProcesses runningPids];" in bo_c,
+      "终局校验：全轮跑完再扫一遍，还活着的从成功列表里剔除")
+check("@\"relaunched\"" in bo_c, "结果里区分「结束」与「被系统重新拉起」")
+check("[RBBackstage releaseOwnedBackstage]" in bo_c,
+      "加速前先撤掉自己挂的保活（一边杀一边托等于白干）")
+check("freedByKillMB" in bo_c and "afterUsedMB" in bo_c,
+      "释放量给实测值（已用内存差），实测为 0 时才退回估值并标 ≈")
+
+vc_c = strip_comments(root_src["RBRootVC.m"])
+check("applyKilledIDs" in vc_c, "加速完成后就地把列表改成未运行（不等几秒的重新枚举）")
+check("self.appliedSeq = ++self.reloadSeq;" in vc_c,
+      "加速就地更新的同时让在飞的 reload 作废（否则旧数据覆盖回来）")
+check("if (seq < self.appliedSeq)" in vc_c, "reload 结果按序号判过期，过期整份丢弃")
+check("UIActivityIndicatorView" not in vc_c,
+      "不再用转圈表示运行中（转圈没有「已结束」的语义，会让人以为一直没杀成）")
+check("后台有 %lu 个 App 在跑，但每个占用都不到 8MB" in vc_c,
+      "候选为空时说清原因，不再只丢一句「无需加速」")
+check("被系统重新拉起，已清 %lu 轮" in vc_c, "结果弹窗如实报「被重新拉起」的数量")
+
+# 图标：1.3.0 换成了仪表环方案，三档尺寸都要在
+import struct as _st
+for _fn, _sz in (("AppIcon60x60.png", 60), ("AppIcon60x60@2x.png", 120), ("AppIcon60x60@3x.png", 180)):
+    _p = _os.path.join(ROOT, "RealBG", _fn)
+    _ok = False
+    if _os.path.exists(_p):
+        _d = open(_p, "rb").read(33)
+        _w, _h = _st.unpack(">II", _d[16:24])
+        _ok = (_w == _sz and _h == _sz)
+    check(_ok, "图标 %s 存在且为 %dx%d" % (_fn, _sz, _sz))
 
 print("\n" + "=" * 56)
 print("通过 %d 项，失败 %d 项" % (len(passed), len(failed)))
