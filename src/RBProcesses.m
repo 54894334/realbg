@@ -525,6 +525,49 @@ static void RBKillViaFrontBoard(NSString *bundleID) {
 
 + (BOOL)isSystemBundle:(NSString *)bundleID { return RBIsSystemBundle(bundleID); }
 
+#pragma mark - 启动
+
+/// 把没在运行的 App 拉起来。走 LSApplicationWorkspace 的
+/// -openApplicationWithBundleID:，这是系统自己「点图标」走的入口，
+/// 需要 frontboard.launchapplications（本包有）。
+///
+/// 注意这里只负责「启动」，不管保活 —— 进程起来之后再交给 RBBackstage 挂 scene。
++ (BOOL)launchApp:(NSString *)bundleID {
+    if (bundleID.length == 0) return NO;
+    if (RBIsSystemBundle(bundleID)) return NO;      // 系统 App 不代为启动
+
+    Class wsCls = NSClassFromString(@"LSApplicationWorkspace");
+    if (!wsCls) {
+        RBLog(@"LSApplicationWorkspace 不可用，无法启动 %@", bundleID);
+        return NO;
+    }
+
+    @try {
+        SEL sDefault = NSSelectorFromString(@"defaultWorkspace");
+        if (![wsCls respondsToSelector:sDefault]) return NO;
+        id ws = ((id (*)(id, SEL))objc_msgSend)(wsCls, sDefault);
+        if (!ws) return NO;
+
+        SEL sOpen = NSSelectorFromString(@"openApplicationWithBundleID:");
+        if ([ws respondsToSelector:sOpen]) {
+            BOOL ok = ((BOOL (*)(id, SEL, id))objc_msgSend)(ws, sOpen, bundleID);
+            RBLog(@"启动 %@ -> %@", bundleID, ok ? @"已发起" : @"被拒绝");
+            return ok;
+        }
+
+        // 老版本只有 openApplicationWithBundleIdentifier: 这种写法
+        SEL sOpen2 = NSSelectorFromString(@"openApplicationWithBundleIdentifier:");
+        if ([ws respondsToSelector:sOpen2]) {
+            BOOL ok = ((BOOL (*)(id, SEL, id))objc_msgSend)(ws, sOpen2, bundleID);
+            RBLog(@"启动 %@ -> %@", bundleID, ok ? @"已发起" : @"被拒绝");
+            return ok;
+        }
+    } @catch (NSException *e) {
+        RBLog(@"启动 %@ 异常：%@", bundleID, e.reason);
+    }
+    return NO;
+}
+
 #pragma mark - 内存
 
 /// mach_host_self() 每次调用都会多一个 send right，用完不 deallocate 就是慢性泄漏。

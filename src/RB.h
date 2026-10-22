@@ -68,6 +68,9 @@
 + (BOOL)killPid:(pid_t)pid;
 /// 结束整个 App（含子进程）
 + (BOOL)killApp:(NSString *)bundleID pid:(pid_t)pid;
+/// 启动一个没在运行的 App（「自启」用）。走 LSApplicationWorkspace，
+/// 依赖 frontboard.launchapplications 权限；失败返回 NO，不抛异常。
++ (BOOL)launchApp:(NSString *)bundleID;
 /// 当前可用内存（MB）
 + (double)freeMemoryMB;
 /// 当前已用内存（MB）

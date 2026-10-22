@@ -327,8 +327,8 @@ if (seq < self.appliedSeq) { ...丢弃... }
 |---|---|---|
 | 解决的问题 | App 切到后台**别被系统挂起 / 别被回收** | App 被结束之后**自动再开回来** |
 | 生效时机 | App 正在运行时 | 本 App（真后台 Pro）启动时 |
-| 实现手段 | 给它挂 FrontBoard scene / RunningBoard 断言，让系统认为它还在前台渲染 | 记一份 bundleID 名单，下次启动按名单重新拉起 |
-| 依赖前提 | 目标 App 必须**已经在运行** | 目标 App 不必在运行 |
+| 实现手段 | 给它挂 FrontBoard scene / RunningBoard 断言，让系统认为它还在前台渲染 | 记一份 bundleID 名单；本工具启动时对没在跑的调 `openApplicationWithBundleID:` 拉起，再挂保活 |
+| 依赖前提 | 目标 App 必须**已经在运行**（没在跑挂不上 scene） | 目标 App 不必在运行，会主动启动 |
 | 代价 | 它一直占着内存，一键加速会绕开它 | 只是「重新打开」，不占常驻内存 |
 | 关闭方式 | 左滑「关闭真后台」 | 右滑「取消自启」 |
 
@@ -625,7 +625,7 @@ V6 后门标记          com.example.myPort / CFMessagePort* / com.shadow.getEsp
 
 `V4` 不是"搜字符串有没有"，是真的把代码签名里的 SuperBlob 解开、把 entitlements 反序列化出来看的，12 条逐条列在脚本输出里。
 
-### 2. 源码逻辑测试 `tests/test_logic.py`（176 项，全通过）
+### 2. 源码逻辑测试 `tests/test_logic.py`（183 项，全通过）
 
 不是复述代码，而是**从真实源文件里解析出白名单/阈值/守卫**，再用这些真实数据跑判定：
 

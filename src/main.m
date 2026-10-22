@@ -59,38 +59,63 @@
     return YES;
 }
 
-/// 把「自启」列表里正在运行的 App 重新拉进真后台。
-/// 进程枚举放后台线程（读几十个 Info.plist），真正建 scene 回主线程（UIKit 相关）。
-/// 锁定名单里的不恢复 —— 锁定的意思是「别管它」，别自己又去给它挂 scene。
+/// 按「自启」名单恢复：
+///   · 已经在跑的 → 直接挂真后台
+///   · 没在跑的   → 先把它启动起来，等进程就绪后再挂真后台
+///
+/// 1.2.x 只做了前一半，于是「自启」对没运行的 App 等于空转 —— 开关点了没效果。
+/// 锁定名单里的不恢复：锁定的意思是「别管它」，别自己又去给它挂 scene。
 - (void)restoreAutoStart {
     NSSet *autoStart = [[RBStore shared].autoStartIDs copy];
     if (autoStart.count == 0) return;
     NSSet *lock = [[RBStore shared].lockIDs copy];
 
-    NSDictionary *running = [RBProcesses runningPids];
-    NSMutableArray *hits = [NSMutableArray array];
-    for (NSString *bid in autoStart) {
-        if ([lock containsObject:bid]) continue;
-        NSNumber *pid = running[bid];
-        if (pid) [hits addObject:@[bid, pid]];
-    }
-    if (hits.count == 0) return;
+    // 进程枚举要读几十个 Info.plist，绝不能在主线程做
+    dispatch_async(dispatch_get_global_queue(QOS_CLASS_UTILITY, 0), ^{
+        NSDictionary *running = [RBProcesses runningPids];
+        NSMutableArray<NSDictionary *> *toAttach = [NSMutableArray array];
+        NSMutableArray<NSString *> *toLaunch = [NSMutableArray array];
 
-    dispatch_async(dispatch_get_main_queue(), ^{
-        for (NSArray *pair in hits) {
-            NSString *bid = pair[0];
-            pid_t pid = (pid_t)[pair[1] intValue];
-            NSError *err = nil;
-            @try {
-                if ([[RBBackstage shared] enableForBundle:bid pid:pid error:&err]) {
-                    RBLog(@"自启真后台已恢复：%@", bid);
-                } else {
-                    RBLog(@"自启恢复失败：%@ (%@)", bid, err.localizedDescription);
-                }
-            } @catch (NSException *e) {
-                RBLog(@"自启恢复异常：%@ %@", bid, e.reason);
-            }
+        for (NSString *bid in autoStart) {
+            if ([lock containsObject:bid]) continue;
+            NSNumber *pid = running[bid];
+            if (pid) [toAttach addObject:@{ @"bid": bid, @"pid": pid }];
+            else [toLaunch addObject:bid];
         }
+
+        // 先把没在跑的拉起来
+        NSMutableArray<NSString *> *launched = [NSMutableArray array];
+        for (NSString *bid in toLaunch) {
+            if ([RBProcesses launchApp:bid]) [launched addObject:bid];
+            else RBLog(@"自启启动失败：%@", bid);
+        }
+        if (launched.count) usleep(1800 * 1000);     // 等进程真正起来
+
+        // 重新取一遍 pid：刚启动的那批这时才有 pid
+        NSDictionary *now = [RBProcesses runningPids];
+        for (NSString *bid in launched) {
+            NSNumber *pid = now[bid];
+            if (pid) [toAttach addObject:@{ @"bid": bid, @"pid": pid }];
+        }
+        if (toAttach.count == 0) return;
+
+        // 建 scene 是 UIKit 操作，回主线程
+        dispatch_async(dispatch_get_main_queue(), ^{
+            for (NSDictionary *d in toAttach) {
+                NSString *bid = d[@"bid"];
+                pid_t pid = (pid_t)[d[@"pid"] intValue];
+                NSError *err = nil;
+                @try {
+                    if ([[RBBackstage shared] enableForBundle:bid pid:pid error:&err]) {
+                        RBLog(@"自启真后台已恢复：%@", bid);
+                    } else {
+                        RBLog(@"自启恢复失败：%@ (%@)", bid, err.localizedDescription);
+                    }
+                } @catch (NSException *e) {
+                    RBLog(@"自启恢复异常：%@ %@", bid, e.reason);
+                }
+            }
+        });
     });
 }
 

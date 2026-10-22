@@ -457,6 +457,21 @@ for _fn, _sz in (("AppIcon60x60.png", 60), ("AppIcon60x60@2x.png", 120), ("AppIc
         _ok = (_w == _sz and _h == _sz)
     check(_ok, "图标 %s 存在且为 %dx%d" % (_fn, _sz, _sz))
 
+print("\n== 15. 1.3.0：自启不再空转（保活 ≠ 自启） ==")
+# 1.2.x 的 restoreAutoStart 只对「已经在运行」的 App 挂真后台，
+# 对没在跑的什么也不做 —— 用户勾了自启，重启工具后毫无变化。
+mn_c = strip_comments(root_src["main.m"])
+check("[RBProcesses launchApp:bid]" in mn_c,
+      "自启对没在跑的 App 会真的启动（原来只处理已在跑的，等于空转）")
+check("usleep(1800 * 1000)" in mn_c, "启动后等进程就绪再挂 scene（立刻挂会拿不到 pid）")
+check("dispatch_get_global_queue" in mn_c[mn_c.index("- (void)restoreAutoStart"):mn_c.index("- (void)applicationDidEnterBackground")],
+      "自启的进程枚举在后台线程（要读几十个 Info.plist）")
+pr_c3 = strip_comments(root_src["RBProcesses.m"])
+check("openApplicationWithBundleID:" in pr_c3, "启动走 LSApplicationWorkspace.openApplicationWithBundleID:")
+check("+ (BOOL)launchApp:(NSString *)bundleID {" in pr_c3, "进程层提供 launchApp:")
+check("if (RBIsSystemBundle(bundleID)) return NO;" in pr_c3, "不代为启动系统 App")
+check("updateHintForTab" in vc_c, "分段切换时把「保活 / 自启」的区别直接写在界面底部")
+
 print("\n" + "=" * 56)
 print("通过 %d 项，失败 %d 项" % (len(passed), len(failed)))
 if failed:

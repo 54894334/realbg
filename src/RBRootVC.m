@@ -140,6 +140,7 @@ static UIColor *RBLock(void)   { return [UIColor colorWithRed:1.00 green:0.78 bl
 @property (nonatomic, strong) UISearchController *search;
 @property (nonatomic, strong) UIButton *boostButton;
 @property (nonatomic, strong) CAGradientLayer *boostGradient;
+@property (nonatomic, strong) UILabel *hintLabel;
 @property (nonatomic, strong) UILabel *memLabel;
 /// 顶部内存卡片
 @property (nonatomic, strong) UIView *memCard;
@@ -183,6 +184,7 @@ static UIColor *RBLock(void)   { return [UIColor colorWithRed:1.00 green:0.78 bl
 - (void)applyFilter;
 - (void)updateMemoryLabel;
 - (void)layoutMemBar;
+- (void)updateHintForTab;
 - (void)segChanged;
 - (void)appDidBecomeActive;
 - (void)toggleBackstage:(RBAppInfo *)info;
@@ -221,6 +223,7 @@ static UIColor *RBLock(void)   { return [UIColor colorWithRed:1.00 green:0.78 bl
     [self buildTable];
     [self buildBoost];
     [self buildSearch];
+    [self updateHintForTab];
 
     self.navigationItem.rightBarButtonItem =
         [[UIBarButtonItem alloc] initWithTitle:@"刷新" style:UIBarButtonItemStylePlain
@@ -451,12 +454,15 @@ static UIColor *RBLock(void)   { return [UIColor colorWithRed:1.00 green:0.78 bl
     [bar addSubview:self.boostButton];
 
     UILabel *hint = [UILabel new];
-    hint.text = @"只结束没锁定的后台 App · 真后台与锁定项一律保留";
+    hint.text = @"";
     hint.font = [UIFont systemFontOfSize:10.5];
     hint.textColor = [UIColor colorWithWhite:1 alpha:0.32];
     hint.textAlignment = NSTextAlignmentCenter;
+    hint.adjustsFontSizeToFitWidth = YES;
+    hint.minimumScaleFactor = 0.85;
     hint.translatesAutoresizingMaskIntoConstraints = NO;
     [bar addSubview:hint];
+    self.hintLabel = hint;
 
     [NSLayoutConstraint activateConstraints:@[
         [bar.leadingAnchor constraintEqualToAnchor:self.view.leadingAnchor],
@@ -636,7 +642,23 @@ static UIColor *RBLock(void)   { return [UIColor colorWithRed:1.00 green:0.78 bl
 
 - (void)segChanged {
     self.tab = self.seg.selectedSegmentIndex;
+    [self updateHintForTab];
     [self applyFilter];
+}
+
+/// 底部的说明文字跟着当前分段走。自启和保活是最容易被混为一谈的两个概念，
+/// 在哪一页就地把区别写出来，比藏在文档里有用。
+- (void)updateHintForTab {
+    NSArray<NSString *> *lines = @[
+        @"点一下看详情 · 右滑可锁定 / 自启 / 杀后台",
+        @"绿点 = 有进程在跑 · 一键加速会结束未锁定的",
+        @"保活 = 留在后台不被挂起，会一直占用内存",
+        @"自启 = 打开本工具时按名单重新拉起并保活",
+        @"锁定 = 加速和退出清理都不碰，优先级最高",
+    ];
+    if (self.tab >= 0 && (NSUInteger)self.tab < lines.count) {
+        self.hintLabel.text = lines[self.tab];
+    }
 }
 
 #pragma mark 表格
@@ -689,8 +711,13 @@ static UIColor *RBLock(void)   { return [UIColor colorWithRed:1.00 green:0.78 bl
                                                                      title:(info.hasAutoStart ? @"取消自启" : @"加入自启")
                                                                    handler:^(UIContextualAction *action, UIView *v, void (^done)(BOOL)) {
         RBStore *s = [RBStore shared];
-        if (info.hasAutoStart) [s.autoStartIDs removeObject:info.bundleID];
-        else [s.autoStartIDs addObject:info.bundleID];
+        if (info.hasAutoStart) {
+            [s.autoStartIDs removeObject:info.bundleID];
+            [self toast:[NSString stringWithFormat:@"%@ 已取消自启", info.name]];
+        } else {
+            [s.autoStartIDs addObject:info.bundleID];
+            [self toast:[NSString stringWithFormat:@"%@ 已加入自启 · 下次打开本工具会自动拉起", info.name]];
+        }
         [s save];
         [self reload];
         done(YES);
