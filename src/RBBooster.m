@@ -20,10 +20,10 @@
 //     后台继续跑。所以「杀一次」不够 —— 现在最多清三轮：杀一轮、重扫、把复活的
 //     再杀一轮，直到没有新增。
 //
-//  ③ 复活后的进程占用很小，被 8MB 门槛挡掉了。
-//     刚被拉起来的 App footprint 常常只有 2-6MB，第一轮的 8MB 过滤会把它漏掉，
-//     结果就是「列表显示还在运行，点加速却说无需加速」。后续轮专门针对
-//     「刚被我们杀过又活过来」的那些，不再看内存大小。
+//  ③ 复活后的进程占用很小，会被「按大小过滤」的规则漏掉。
+//     刚被拉起来的 App footprint 常常只有 2-6MB。1.3.0 的应对是给复扫单独开一条
+//     不看大小的通道；1.4.0 更进一步，把门槛整个删掉（见下面 RBMinWorthMB），
+//     因为同一个坑在首轮也踩了 —— 用户看到的「列表五个 App 只清两个」就是它。
 //
 //  三条安全线：
 //    · com.apple.* 一律不碰（系统 App 会随 iOS 版本增减，按前缀整片拦比维护清单可靠）
@@ -38,11 +38,23 @@
 #import <dlfcn.h>
 
 // proc_pid_rusage 对不同 uid 的进程可能返回 EPERM。真拿不到就按这个值估，
-// 而不是当成 0 —— 否则 <8MB 的过滤会把所有候选都筛掉，按钮永远「没有可清理的进程」。
+// 而不是当成 0 —— 当成 0 会让界面显示「0 MB」，用户会以为这个 App 不占内存。
 static const double RBFallbackFootprintMB = 24.0;
 
-// 第一轮候选的最小占用门槛。太小的进程杀了也没收益，还会让结果列表噪音很大。
-static const double RBMinWorthMB = 8.0;
+// 第一轮候选的最小占用门槛。
+//
+// 1.3.0 这里写的是 8.0，注释理由是「太小了杀了没收益」。这个门槛直接造成了
+// 用户看到的「运行列表里五个 App，加速只清两个」：
+//
+//   iOS 会把切到后台的 App 挂起（suspended），挂起进程的 phys_footprint 会被
+//   压到个位数 MB —— 爱加速 5MB、饿了么 6MB、高德 7MB 都很常见。
+//   于是它们全部落在 8MB 以下，被静默跳过；只有一直活跃的微信（400+MB）
+//   和 TrollStore（11MB）够格，界面就只报这两个。
+//
+// 而用户点「一键加速」的意图本来就是「把后台清干净」，跟单个进程占多大无关：
+// 清掉一个 5MB 的挂起 App 同样是清掉一个后台进程，下次点开它自己会重新加载。
+// 所以门槛归零 —— 只要在运行、且不是系统/锁定/真后台，就清。
+static const double RBMinWorthMB = 0.0;
 
 // 最多清几轮。轮与轮之间系统会重新拉起一部分 App，多扫两轮能显著提高净效果。
 static const int RBMaxRounds = 3;
@@ -78,20 +90,51 @@ static const int RBMaxRounds = 3;
 
 #pragma mark - 候选
 
-/// 能不能动这个 App（不含内存判断）。所有过滤理由集中在一处，
-/// 保证「候选」「复活复扫」「锁定统计」三处判断完全一致。
+/// 单个进程的占用，带「是否估值」标记。界面要显示这个数字，
+/// 不能把 0 直接当 0MB 展示 —— 那会让用户以为挂起的 App 不占内存。
++ (NSDictionary *)usageForPid:(pid_t)pid {
+    double raw = [self footprintMBForPid:pid];
+    if (raw > 0) return @{ @"mb": @(raw), @"estimated": @NO };
+    return @{ @"mb": @(RBFallbackFootprintMB), @"estimated": @YES };
+}
+
+/// 为什么不能动它；返回 nil 表示可以动。判定顺序即优先级，
+/// 「候选」「复活复扫」「锁定统计」「界面标记」「跳过原因」五处共用这一份，
+/// 保证任何一处算出来的结论都和别处一致。
++ (NSString *)skipReasonForBundle:(NSString *)bid
+                              pid:(pid_t)pid
+                          protect:(NSSet *)protect
+                          lockSet:(NSSet *)lockSet
+                      systemNames:(NSSet *)sysNames {
+    if (bid.length == 0) return @"无法识别";
+    if ([bid isEqualToString:RB_BUNDLE]) return @"自身";
+    if (pid <= 0) return @"已退出";
+    if (pid == getpid()) return @"自身";
+    if ([sysNames containsObject:bid]) return @"系统";
+    if ([RBProcesses isSystemBundle:bid]) return @"系统";
+    if ([lockSet containsObject:bid]) return @"锁定";
+    if (protect && [protect containsObject:bid]) return @"真后台";
+    return nil;
+}
+
 + (BOOL)canTouchBundle:(NSString *)bid
                    pid:(pid_t)pid
                protect:(NSSet *)protect
                lockSet:(NSSet *)lockSet
            systemNames:(NSSet *)sysNames {
-    if (bid.length == 0) return NO;
-    if (pid <= 0 || pid == getpid()) return NO;
-    if ([RBProcesses isSystemBundle:bid]) return NO;
-    if ([sysNames containsObject:bid]) return NO;
-    if ([lockSet containsObject:bid]) return NO;
-    if (protect && [protect containsObject:bid]) return NO;
-    return YES;
+    return [self skipReasonForBundle:bid pid:pid protect:protect
+                             lockSet:lockSet systemNames:sysNames] == nil;
+}
+
+/// 加速会不会动这个 App。界面用它决定要不要画「可清理」标记 ——
+/// 没有这个，用户只能看到「运行中」，然后困惑为什么加速不碰它。
++ (BOOL)isBoostableBundle:(NSString *)bundleID protect:(NSSet *)protect {
+    if (bundleID.length == 0) return NO;
+    return [self skipReasonForBundle:bundleID
+                                 pid:1
+                             protect:protect
+                             lockSet:[RBStore shared].lockIDs
+                         systemNames:[RBProcesses protectedBundleIDs]] == nil;
 }
 
 /// 全量候选：只排除系统 App、自己、系统保护清单、锁定名单、以及传入的 exclude。
@@ -141,6 +184,36 @@ static const int RBMaxRounds = 3;
     NSMutableArray<NSDictionary *> *out = [NSMutableArray array];
     for (NSDictionary *d in [self rawCandidatesExcluding:excl minMB:RBMinWorthMB]) {
         if ([lock containsObject:d[@"bundleID"]]) [out addObject:d];
+    }
+    return out;
+}
+
+/// 「运行中、但加速不会碰」的清单及原因。
+/// 这是 1.4.0 补的透明度：加速前告诉用户「这 N 个我不动，因为 X」，
+/// 而不是等用户自己数列表、发现少清了几个再来问。
++ (NSArray<NSDictionary *> *)protectedRunningProtecting:(NSSet *)protect {
+    NSMutableArray *out = [NSMutableArray array];
+    NSDictionary *running = [RBProcesses runningPids];
+    NSSet *sysNames = [RBProcesses protectedBundleIDs];
+    NSSet *lockSet = [RBStore shared].lockIDs;
+
+    for (NSString *bid in running) {
+        @autoreleasepool {
+            pid_t pid = [running[bid] intValue];
+            NSString *why = [self skipReasonForBundle:bid pid:pid protect:protect
+                                              lockSet:lockSet systemNames:sysNames];
+            if (!why) continue;
+
+            double raw = [self footprintMBForPid:pid];
+            BOOL estimated = (raw <= 0);
+            [out addObject:@{
+                @"bundleID": bid,
+                @"pid": @(pid),
+                @"mb": @(estimated ? RBFallbackFootprintMB : raw),
+                @"estimated": @(estimated),
+                @"reason": why,
+            }];
+        }
     }
     return out;
 }

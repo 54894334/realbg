@@ -2,7 +2,7 @@
 
 基于对 **巨魔真后台 1.5**（`cn.bswbw.RealBackstage`，`RealBackstage_1.5.tipa`，358,657 字节）的静态逆向，**重写**的同功能 App —— 不是改包，源码级重建，所以后门、冗余权限、写死的路径一个都不继承。
 
-- 包名：`cn.bswbw.RealBG`　显示名：真后台 Pro　版本：1.3.0
+- 包名：`cn.bswbw.RealBG`　显示名：真后台 Pro　版本：1.4.0
 - 目标系统：iOS 14.0+（arm64 单切片）
 - 安装方式：TrollStore 直接装 `.tipa`，**不需要越狱**
 
@@ -145,7 +145,7 @@ mach-lookup: frontboard.systemappservices / runningboardd  连这两个服务
 - 28 个系统 App（SpringBoard、电话、短信、相机、设置…）+ 自己
 - 35 个系统守护进程（`launchd`、`backboardd`、`runningboardd`、`securityd`、`tccd`、`cfprefsd`… 按可执行文件名匹配）
 - 已开真后台的 App（在 `backstageIDs` 里）
-- 占用 < 8MB 的（动了也省不出东西）
+- 系统 App、真后台白名单、锁定名单（1.4.0 起不再按占用大小过滤）
 
 ---
 
@@ -161,7 +161,7 @@ mach-lookup: frontboard.systemappservices / runningboardd  连这两个服务
 | 3 | 内存标签每次刷新都重算「可清理」，和列表刷新重复扫两遍进程 | 电量/流畅度白给 | 合并进 `reload` 一次算完，存成属性 |
 | 4 | 弹窗还在显示时又 present 新弹窗 | 控制台 `already presenting`，提示**直接不显示** | 统一 `presentAlert:`：先关旧的再弹 |
 | 5 | `mach_host_self()` 每次都拿一个 send right，从不释放 | 长时间挂着跑会累积端口权 | `RBHostPort()` 缓存一个端口反复用 |
-| 6 | `proc_pid_rusage` 失败返回 0，又被 `< 8MB 跳过` 规则筛掉 | **所有候选消失，按钮永远「没有可清理」** | 取不到就按 24MB 估，UI 上标 `~` |
+| 6 | `proc_pid_rusage` 失败返回 0，会被当成「0MB 不占内存」 | **候选消失，按钮永远「没有可清理」** | 取不到就按 24MB 估，UI 上标 `~` |
 | 7 | `windowLevel` 用 `method_exchangeImplementations` 换 IMP | 若该方法继承自 `UIWindow`，等于把**全进程所有窗口**层级改成 1e7（弹窗/键盘一起乱） | 改 `class_addMethod`，只作用在 `UIRootSceneWindow` |
 | 8 | binder 不可用时，已 `createScene` 的 scene 不回收 | scene 泄漏，目标 App 状态错乱 | 走 `destroyScene:withTransitionContext:` |
 | 9 | 目标 App 被杀后旧 scene 记录不失效 | `isEnabled` 永远 YES，开关显示「已开启」其实早没了 | `dropIfStale:` + `kill(pid,0)` 探活 |
@@ -191,7 +191,7 @@ entitlements 仍是 12 条，一条没加。仍然没有：网络、IPC、`dlope
 |---|---|
 | `proc_pid_rusage` 跨 uid | 拿不到就显示 `~24 MB`，数字是估值不是实测；能拿到时是真值 |
 | scene 挂载 | iOS 16/17/18 的 FrontBoard 类名/方法名有差异，失败会自动退回 RBS assertion（保活但可能重载 UI） |
-| 加速效果 | 只动第三方 App；系统 App、真后台白名单、8MB 以下的一律不动，所以「释放量」不会很夸张 |
+| 加速效果 | 只动第三方 App；系统 App、真后台白名单、锁定名单一律不动。1.4.0 起不再按大小过滤，所以会清得更干净 |
 
 ## 五、1.3.0：为什么「加速完了它还在」
 
@@ -260,7 +260,7 @@ for (int round = 0; round < RBMaxRounds; round++) {
 }
 ```
 
-### 根因三：复活后的进程太小，被 8MB 门槛漏掉了
+### 根因三：复活后的进程太小，被「按大小过滤」的规则漏掉了
 
 第一轮候选有 `mb < 8` 的过滤（太小不值得动）。但 App 刚被拉起时 footprint 常常只有
 2–6MB —— 它明明在跑，却因为「太小」进不了候选。这就产生了现象 2：
@@ -344,7 +344,54 @@ if (seq < self.appliedSeq) { ...丢弃... }
 
 ---
 
-## 六、1.2.0：1.1.0 仍然秒退的真正原因
+## 六、1.4.0：运行列表里七个 App，加速只清两个
+
+### 现场
+
+运行页上 7 个 App 都亮着绿点，点一键加速，弹窗只有两条：
+微信 403 MB、TrollStore 11 MB。
+爱加速、饿了么、高德地图、闲鱼一个都没进候选。
+
+### 根因：候选阶段那道 8MB 门槛
+
+`RBMinWorthMB` 原来是 8.0，注释理由是「太小了杀了没收益」。
+但 iOS 会把切到后台的 App 挂起（suspended），挂起进程的 `phys_footprint`
+会被压到个位数 MB：
+
+| App | 挂起后的典型 footprint |
+|---|---|
+| 爱加速 | 5–8 MB |
+| 饿了么 | 6–10 MB |
+| 高德地图 | 7–12 MB |
+| 闲鱼 | 5–9 MB |
+| 微信（后台常驻、一直活跃） | 300–500 MB |
+
+于是只有活着的微信够格，其余全部被静默跳过。
+1.3.0 已经在「复活复扫」这条链上绕开了门槛，但**首轮候选仍然用它** —— 同一个坑踩了两次。
+
+### 修法
+
+1. **门槛归零**：只要在运行、且不是系统 / 锁定 / 真后台，就是候选。
+   清掉一个 5MB 的挂起 App 和清掉一个 400MB 的进程，对用户是同一件事 —— 少一个后台。
+2. **所有过滤理由收进一个函数** `skipReasonForBundle:pid:protect:lockSet:systemNames:`，
+   返回 `系统` / `锁定` / `真后台` / `自身` / `已退出`。
+   候选、复扫、锁定统计、界面标记、跳过原因五处共用这一份，
+   不会再出现「这里放行、那里拦截」。
+3. **界面把话说清楚**，而不是让用户数列表：
+   - 每行右下角显示实时占用（`403 MB`；带 `~` 表示 rusage 读不到、按经验估的）
+   - 系统 App 的状态从「运行中」改成「系统」—— 用户正是看到「运行中」才问为什么不清理
+   - 加速前弹窗分两段：`预计释放` + `保留不动：锁定 N 个 / 真后台 N 个 / 系统 N 个`
+   - 「不需要加速」时列出到底是谁在保护它们
+4. **单杀也修了**：右键菜单的「杀后台」原来直接 `kill()`，
+   现在先 `disableForBundle:` 撤掉保活再杀，杀完按返回值决定就地改状态还是重扫 ——
+   否则 FrontBoard 会立刻把它拉回来。
+
+### 为什么不做「单 App 强制清理」
+
+一键加速的语义就是「把后台清干净」，单个 App 已经有右键菜单的「杀后台」。
+再加一层强制开关只会让保护规则更复杂，而复杂度正是这次问题的来源。
+
+## 七、1.2.0：1.1.0 仍然秒退的真正原因
 
 1.1.0 装上去还是点开就退，而且「文件」App 里找不到本 App 的目录。这两条线索合起来指向一件事：
 **进程很可能根本没跑到 `main`**。围绕这个假设重新排查，找到三个真问题，其中一个是我自己在上一版里制造的。
@@ -527,7 +574,7 @@ com.apple.private.security.no-container  （原包也没有）
 | 7 | 产物校验新增 V7：逐个核对 `LC_LOAD_DYLIB` | 出现 `PrivateFrameworks` 直接判失败 |
 | 8 | 产物校验新增 `cryptid` / `LC_MAIN` 检查 | 非 0 cryptid、缺入口点都判失败 |
 
-## 七、1.1.0：闪退定位 + 保留名单
+## 八、1.1.0：闪退定位 + 保留名单
 
 ### 1. 闪退：找到两处真实的崩溃点
 
@@ -593,7 +640,7 @@ exe substringToIndex: r.location + r2.location + r2.length     // 少加了 r.le
 
 `r` 是 `/Bundle/Application/` 这个标记的 range。少加它的长度，截出来的路径整体左移 19 个字符，永远读不到 `Info.plist`，只能退化成用 `.app` 目录名当 bundleID。结果就是**进程枚举到的 bundleID 跟配置里存的对不上，「运行中」这个状态一直是错的**。现在改用字符串拼接，不再做索引算术。
 
-## 八、白苹果风险评估
+## 九、白苹果风险评估
 
 结论：**不会白苹果**。逐条说明为什么：
 
@@ -603,11 +650,11 @@ exe substringToIndex: r.location + r2.location + r2.length     // 少加了 r.le
 4. **不改系统文件。** 全部写操作只落在 `/var/mobile/Library/Preferences/cn.bswbw.RealBG.plist` 这一个文件里。
 5. **TrollStore 装的是普通 App。** 不替换系统 App、不改 `SpringBoard`、不装 LaunchDaemon，出问题删掉 App 就恢复。
 
-真要说风险，只有一条：**杀后台太狠会让某些 App 冷启动变慢**（内存是省下来了，代价是重开要重新加载）。所以默认跳过系统 App、跳过 8MB 以下、跳过真后台白名单，把误伤面压到最小。
+真要说风险，只有一条：**杀后台太狠会让某些 App 冷启动变慢**（内存是省下来了，代价是重开要重新加载）。所以默认跳过系统 App、跳过真后台白名单、跳过锁定名单，把误伤面压到最小。
 
 ---
 
-## 九、测试与验证（都是真实跑过的，不是"应该没问题"）
+## 十、测试与验证（都是真实跑过的，不是"应该没问题"）
 
 ### 1. 产物硬校验 `tests/verify_tipa.py`（读真实字节）
 
@@ -625,7 +672,7 @@ V6 后门标记          com.example.myPort / CFMessagePort* / com.shadow.getEsp
 
 `V4` 不是"搜字符串有没有"，是真的把代码签名里的 SuperBlob 解开、把 entitlements 反序列化出来看的，12 条逐条列在脚本输出里。
 
-### 2. 源码逻辑测试 `tests/test_logic.py`（183 项，全通过）
+### 2. 源码逻辑测试 `tests/test_logic.py`（199 项，全通过）
 
 不是复述代码，而是**从真实源文件里解析出白名单/阈值/守卫**，再用这些真实数据跑判定：
 
@@ -659,7 +706,7 @@ CI 里两步都挂了：先跑 `test_logic.py`，出包后再跑 `verify_tipa.py
 第 1 项过不了（闪退）→ 多半是 iOS 版本与 `UIRootWindowScenePresentationBinder` 的类名差异，把 `设置 → 隐私 → 分析与改进 → 分析数据` 里的 `RealBG` 崩溃日志给我，能直接定位。
 第 3 项过不了 → 那台系统的 FBScene 路径变了，会看到日志「scene 方案异常」，会自动退回 RBS assertion 兜底（保活但 UI 状态可能重载）。
 
-## 十、目录结构
+## 十一、目录结构
 
 ```
 Makefile                  Theos application 工程
@@ -679,7 +726,7 @@ tests/verify_tipa.py      产物硬校验（结构/Mach-O/签名 entitlements/�
 .github/workflows/build.yml  Theos 编译 → 组 .app → ldid 签 → 打 tipa → 硬校验 → 推 dist 分支
 ```
 
-## 十一、构建
+## 十二、构建
 
 CI 在 macOS runner 上跑 Theos，产物推到 `dist` 分支：
 
@@ -700,7 +747,7 @@ ldid -Sentitlements.plist "$APP/RealBG"
 mkdir -p Payload && cp -R "$APP" Payload/ && zip -qry RealBG.tipa Payload
 ```
 
-## 十二、用法
+## 十三、用法
 
 1. TrollStore 装 `RealBG.tipa`
 2. 打开要保活的 App，回本 App 里左滑 → **开启真后台**（或点右上「全部真后台」一键给所有运行中的 App 挂上）
@@ -714,4 +761,4 @@ mkdir -p Payload && cp -R "$APP" Payload/ && zip -qry RealBG.tipa Payload
 - **其中 M 个被系统重新拉起，已清 K 轮** —— SpringBoard 把它拉回来过，又清掉了
 - **失败 J 个** —— 系统拒绝或进程被托管，已经跳过，不会谎报成功
 
-如果提示「不需要加速」，会说明具体原因（当前没第三方 App 在跑 / 在跑但都不到 8MB）。
+如果提示「不需要加速」，会列出到底是谁在保护它们（锁定 N 个 / 真后台 N 个 / 系统 N 个）。

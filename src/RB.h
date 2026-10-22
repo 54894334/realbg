@@ -14,7 +14,7 @@
 #import <UIKit/UIKit.h>
 #import <Foundation/Foundation.h>
 
-#define RB_VERSION @"1.3.0"
+#define RB_VERSION @"1.4.0"
 #define RB_BUNDLE @"cn.bswbw.RealBG"
 
 // 配置：/var/mobile/Library/Preferences/cn.bswbw.RealBG.plist
@@ -34,6 +34,14 @@
 @property (nonatomic, assign) BOOL      hasAutoStart;   // 已加自启
 @property (nonatomic, assign) BOOL      hasSuicide;     // 退出本 App 时结束
 @property (nonatomic, assign) BOOL      locked;         // 已锁定：加速永不清理
+/// 实时物理占用（MB）。1.4.0 起直接显示在列表上 ——
+/// 用户看不到数字时，只能靠猜「为什么这个 App 没被清理」。
+@property (nonatomic, assign) double    memMB;
+/// NO 表示 proc_pid_rusage 没读到（跨 uid 被拒），memMB 是按经验估的值。
+@property (nonatomic, assign) BOOL      memKnown;
+/// 加速会不会动它。系统 App、锁定、真后台三种情况为 NO —— 列表上直接标出来，
+/// 免得用户以为「运行中就该被清理」。
+@property (nonatomic, assign) BOOL      boostable;
 @end
 
 #pragma mark - 配置
@@ -108,11 +116,19 @@
 /// killed 只统计「杀完验证确实消失」的；relaunched 是「杀掉了又被系统拉起来」的数量。
 + (NSDictionary *)boostProtecting:(NSSet *)protect;
 /// 可清理候选（按占用内存降序），元素：@{bundleID, pid, mb, estimated}
+/// 1.4.0 起不再有内存门槛：只要在运行、且不是系统/锁定/真后台，就是候选。
 + (NSArray<NSDictionary *> *)candidatesProtecting:(NSSet *)protect;
 /// 被保留名单挡下、本来会被清理的进程（用来在界面上说明「省下了多少」）
 + (NSArray<NSDictionary *> *)lockedCandidatesProtecting:(NSSet *)protect;
-/// 单个进程的真实物理占用（phys_footprint，MB）
+/// 运行中但不会清理的进程及原因，元素：@{bundleID, pid, mb, estimated, reason}
+/// reason 取值：@“系统” / @“锁定” / @“真后台” / @“自身”
++ (NSArray<NSDictionary *> *)protectedRunningProtecting:(NSSet *)protect;
+/// 单个进程的真实物理占用（phys_footprint，MB）；读不到返回 0
 + (double)footprintMBForPid:(pid_t)pid;
+/// 占用 + 是否估值，元素：@{@"mb", @"estimated"}。界面显示用。
++ (NSDictionary *)usageForPid:(pid_t)pid;
+/// 加速会不会动这个 App（不含内存判断）。界面用它决定是否画「可清理」标记。
++ (BOOL)isBoostableBundle:(NSString *)bundleID protect:(NSSet *)protect;
 @end
 
 #pragma mark - UI

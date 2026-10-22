@@ -27,6 +27,9 @@ static UIColor *RBLock(void)   { return [UIColor colorWithRed:1.00 green:0.78 bl
 @property (nonatomic, strong) UILabel *nameLabel;
 @property (nonatomic, strong) UILabel *bidLabel;
 @property (nonatomic, strong) UILabel *stateLabel;
+/// 占用内存（第二行，右下角）。用户看不到数字时只能靠猜「为什么这个没被清理」，
+/// 所以把每个运行中 App 的实时占用直接摆出来。
+@property (nonatomic, strong) UILabel *memLabel;
 @property (nonatomic, strong) UIView *dot;
 - (void)bind:(RBAppInfo *)info;
 @end
@@ -73,6 +76,12 @@ static UIColor *RBLock(void)   { return [UIColor colorWithRed:1.00 green:0.78 bl
         _stateLabel.textAlignment = NSTextAlignmentRight;
         [self.contentView addSubview:_stateLabel];
 
+        _memLabel = [UILabel new];
+        _memLabel.textColor = [UIColor colorWithWhite:1 alpha:0.38];
+        _memLabel.font = [UIFont monospacedDigitSystemFontOfSize:11 weight:UIFontWeightRegular];
+        _memLabel.textAlignment = NSTextAlignmentRight;
+        [self.contentView addSubview:_memLabel];
+
         // 原来这里是个 UIActivityIndicatorView（转圈）。转圈本身没有「结束」的语义，
         // 用户看到它一直转会以为进程还在跑 —— 换成实心圆点：绿＝在跑，灰＝没在跑。
         _dot = [UIView new];
@@ -89,12 +98,13 @@ static UIColor *RBLock(void)   { return [UIColor colorWithRed:1.00 green:0.78 bl
     CGFloat w = self.contentView.bounds.size.width;
     _iconView2.frame = CGRectMake(16, (h - 46) / 2.0, 46, 46);
     CGFloat tx = CGRectGetMaxX(_iconView2.frame) + 13;
-    CGFloat stateW = 96;
-    CGFloat textW = MAX(40, w - tx - stateW - 26);
+    CGFloat stateW = 104;
+    CGFloat textW = MAX(40, w - tx - stateW - 30);
     _nameLabel.frame = CGRectMake(tx, h / 2.0 - 20, textW, 21);
     _bidLabel.frame  = CGRectMake(tx, h / 2.0 + 1, textW, 16);
-    _stateLabel.frame = CGRectMake(w - stateW - 16, h / 2.0 - 9, stateW, 18);
-    _dot.frame = CGRectMake(w - stateW - 26, (h - 7) / 2.0, 7, 7);
+    _stateLabel.frame = CGRectMake(w - stateW - 16, h / 2.0 - 20, stateW, 18);
+    _memLabel.frame   = CGRectMake(w - stateW - 16, h / 2.0 + 1, stateW, 16);
+    _dot.frame = CGRectMake(w - stateW - 27, h / 2.0 - 14.5, 7, 7);
 }
 
 - (void)bind:(RBAppInfo *)info {
@@ -111,7 +121,13 @@ static UIColor *RBLock(void)   { return [UIColor colorWithRed:1.00 green:0.78 bl
 
     NSString *state = nil;
     if (tags.count == 0) {
-        state = info.isRunning ? @"运行中" : @"未运行";
+        if (info.isRunning) {
+            // 系统 App 同样在运行，但加速永远不会碰它们。原来这里也写「运行中」，
+            // 用户自然会问「为什么运行中却不清理」——直接标「系统」。
+            state = info.isSystem ? @"系统" : @"运行中";
+        } else {
+            state = @"未运行";
+        }
     } else if (tags.count <= 2) {
         state = [tags componentsJoinedByString:@" · "];
     } else {
@@ -119,15 +135,29 @@ static UIColor *RBLock(void)   { return [UIColor colorWithRed:1.00 green:0.78 bl
     }
     self.stateLabel.text = state;
 
+    // 第二行：真实占用。读不到的按经验值显示并加「~」，别让用户以为是精确数字。
+    if (info.isRunning && info.memMB > 0) {
+        self.memLabel.text = [NSString stringWithFormat:@"%@%@",
+                              info.memKnown ? @"" : @"~", RBHumanMB(info.memMB)];
+    } else {
+        self.memLabel.text = info.isRunning ? @"—" : @"";
+    }
+
     UIColor *onColor = info.locked ? RBLock() : RBAccent();
     self.dot.hidden = !info.isRunning;
     self.dot.backgroundColor = info.locked ? RBLock() : RBAccent();
     if (tags.count) {
         self.stateLabel.textColor = onColor;
+    } else if (info.isRunning && info.isSystem) {
+        self.stateLabel.textColor = [UIColor colorWithWhite:1 alpha:0.35];
     } else {
         self.stateLabel.textColor = info.isRunning ? [UIColor colorWithWhite:1 alpha:0.72]
                                                    : [UIColor colorWithWhite:1 alpha:0.30];
     }
+    // 动不了的 App 内存数字也压暗，视觉上区分「可清理」与「不会动」
+    self.memLabel.textColor = (!info.isRunning)         ? [UIColor clearColor]
+                            : (info.boostable ? [UIColor colorWithWhite:1 alpha:0.50]
+                                              : [UIColor colorWithWhite:1 alpha:0.26]);
 }
 
 @end
@@ -165,6 +195,8 @@ static UIColor *RBLock(void)   { return [UIColor colorWithRed:1.00 green:0.78 bl
 @property (nonatomic, assign) double usedMB;
 @property (nonatomic, assign) double freeMB;
 @property (nonatomic, assign) double estimateMB;
+/// 「可清理」里含有估值成分（读不到 rusage 的进程按经验值算），显示时加 ≈
+@property (nonatomic, assign) BOOL estimateApprox;
 @property (nonatomic, assign) BOOL hasMemory;
 @property (nonatomic, assign) double memRatio;
 @property (nonatomic, assign) NSUInteger lockCount;
@@ -527,6 +559,16 @@ static UIColor *RBLock(void)   { return [UIColor colorWithRed:1.00 green:0.78 bl
             i.hasAutoStart = [store.autoStartIDs containsObject:i.bundleID];
             i.hasSuicide = [store.suicideIDs containsObject:i.bundleID];
             i.locked = [store.lockIDs containsObject:i.bundleID];
+            i.boostable = i.isRunning && [RBBooster isBoostableBundle:i.bundleID protect:protect];
+
+            if (i.isRunning) {
+                NSDictionary *u = [RBBooster usageForPid:i.pid];
+                i.memMB = [u[@"mb"] doubleValue];
+                i.memKnown = ![u[@"estimated"] boolValue];
+            } else {
+                i.memMB = 0;
+                i.memKnown = NO;
+            }
         }
 
         // 内存与「可清理」只在这里算一次，别在每次刷新界面时重算
@@ -534,8 +576,10 @@ static UIColor *RBLock(void)   { return [UIColor colorWithRed:1.00 green:0.78 bl
         double freeMB = [RBProcesses freeMemoryMB];
         BOOL hasMemory = (used + freeMB) > 1.0;
         double est = 0;
+        BOOL estApprox = NO;
         for (NSDictionary *d in [RBBooster candidatesProtecting:protect]) {
             est += [d[@"mb"] doubleValue];
+            if ([d[@"estimated"] boolValue]) estApprox = YES;
         }
 
         NSUInteger lockCount = store.lockIDs.count;
@@ -555,6 +599,7 @@ static UIColor *RBLock(void)   { return [UIColor colorWithRed:1.00 green:0.78 bl
             self.usedMB = used;
             self.freeMB = freeMB;
             self.estimateMB = est;
+            self.estimateApprox = estApprox;
             self.hasMemory = hasMemory;
             self.lockCount = lockCount;
             if (apps.count > 0) self.safeMode = NO;    // 枚举成功就退出安全模式
@@ -603,7 +648,10 @@ static UIColor *RBLock(void)   { return [UIColor colorWithRed:1.00 green:0.78 bl
 
     self.usedValueLabel.text  = RBHumanMB(self.usedMB);
     self.freeValueLabel.text  = RBHumanMB(self.freeMB);
-    self.cleanValueLabel.text = self.estimateMB > 0.5 ? RBHumanMB(self.estimateMB) : @"0";
+    self.cleanValueLabel.text = self.estimateMB > 0.5
+        ? [NSString stringWithFormat:@"%@%@", self.estimateApprox ? @"≈" : @"",
+           RBHumanMB(self.estimateMB)]
+        : @"0";
 
     double total = self.usedMB + self.freeMB;
     self.memRatio = total > 1.0 ? (self.usedMB / total) : 0;
@@ -627,6 +675,9 @@ static UIColor *RBLock(void)   { return [UIColor colorWithRed:1.00 green:0.78 bl
         if ([set containsObject:i.bundleID]) {
             i.isRunning = NO;
             i.pid = 0;
+            i.memMB = 0;
+            i.memKnown = NO;
+            i.boostable = NO;
         }
     }
     // 让所有在飞的 reload 作废，避免它们带着杀之前的数据覆盖回来
@@ -768,15 +819,30 @@ static UIColor *RBLock(void)   { return [UIColor colorWithRed:1.00 green:0.78 bl
     [ac addAction:[UIAlertAction actionWithTitle:(info.hasBackstage ? @"关闭真后台" : @"开启真后台")
                                            style:UIAlertActionStyleDefault
                                          handler:^(UIAlertAction *a) { [self toggleBackstage:info]; }]];
-    if (info.isRunning) {
+    if (info.isRunning && info.isSystem) {
+        // 系统 App 放一条明确说明，而不是让用户点了没反应
+        UIAlertAction *a = [UIAlertAction actionWithTitle:@"系统 App，不在清理范围"
+                                                    style:UIAlertActionStyleDefault handler:nil];
+        a.enabled = NO;
+        [ac addAction:a];
+    } else if (info.isRunning) {
         [ac addAction:[UIAlertAction actionWithTitle:@"杀后台" style:UIAlertActionStyleDestructive
                                              handler:^(UIAlertAction *a) {
             if (info.locked) {
                 [self toast:@"已锁定，先取消锁定再杀"];
                 return;
             }
-            [RBProcesses killApp:info.bundleID pid:info.pid];
-            [self reloadAfterDelay];
+            // 先撤掉这个 App 的保活再杀。留着 scene 直接 kill，FrontBoard 会立刻把它
+            // 重新拉到后台 —— 用户看到的就是「杀了还在跑」。
+            [[RBBackstage shared] disableForBundle:info.bundleID];
+            BOOL ok = [RBProcesses killApp:info.bundleID pid:info.pid];
+            if (ok) {
+                [self applyKilledIDs:@[info.bundleID]];
+                [self toast:[NSString stringWithFormat:@"%@ 已结束", info.name]];
+            } else {
+                [self toast:[NSString stringWithFormat:@"%@ 没能结束（可能被系统托管）", info.name]];
+                [self reloadAfterDelay];
+            }
         }]];
     }
     [ac addAction:[UIAlertAction actionWithTitle:(info.hasSuicide ? @"取消「退出即杀」" : @"开启「退出即杀」")
@@ -896,15 +962,9 @@ static UIColor *RBLock(void)   { return [UIColor colorWithRed:1.00 green:0.78 bl
     NSSet *protect = [[RBStore shared] allProtectedIDs];
     dispatch_async(dispatch_get_global_queue(QOS_CLASS_USER_INITIATED, 0), ^{
         NSArray *cands = [RBBooster candidatesProtecting:protect];
-        NSArray *locked = [RBBooster lockedCandidatesProtecting:protect];
-
-        // 「为什么没有候选」要说清楚。用实时的进程表算，别用界面上的旧快照 ——
-        // 安全模式下 allApps 可能是空的，那样会误报「没有第三方 App 在跑」。
-        NSMutableSet *aliveSet = [NSMutableSet set];
-        for (NSString *bid in [RBProcesses runningPids]) {
-            if (![RBProcesses isSystemBundle:bid]) [aliveSet addObject:bid];
-        }
-        NSUInteger aliveOthers = aliveSet.count;
+        // 「运行中但不会碰」的完整清单（含系统 / 锁定 / 真后台）。
+        // 用户问的「为什么只清两个」就靠它回答：把没清的也列出来，别让他自己数。
+        NSArray *held = [RBBooster protectedRunningProtecting:protect];
 
         dispatch_async(dispatch_get_main_queue(), ^{
             [self setBoostBusy:NO title:@"一键加速"];
@@ -912,37 +972,37 @@ static UIColor *RBLock(void)   { return [UIColor colorWithRed:1.00 green:0.78 bl
             // 锁定项的名字要换成 App 显示名，bundleID 对普通用户没意义
             NSDictionary *nameMap = [self nameMap];
 
-            NSMutableString *lockLine = [NSMutableString string];
-            if (locked.count > 0) {
-                double kept = 0;
-                NSMutableArray<NSString *> *names = [NSMutableArray array];
-                for (NSDictionary *d in locked) {
-                    kept += [d[@"mb"] doubleValue];
-                    NSString *bid = d[@"bundleID"];
-                    [names addObject:nameMap[bid] ?: bid];
-                }
-                NSUInteger show = MIN(names.count, 5u);
-                [lockLine appendFormat:@"🔒 已锁定跳过 %lu 个（约 %@）：%@%@\n\n",
-                 (unsigned long)locked.count, RBHumanMB(kept),
+            // 按原因分组。系统进程数量多、名字对用户也没意义，只报个数。
+            NSMutableDictionary<NSString *, NSMutableArray<NSString *> *> *groups = [NSMutableDictionary dictionary];
+            for (NSDictionary *d in held) {
+                NSString *why = d[@"reason"] ?: @"其他";
+                NSString *bid = d[@"bundleID"];
+                if (!groups[why]) groups[why] = [NSMutableArray array];
+                [groups[why] addObject:nameMap[bid] ?: bid];
+            }
+
+            NSMutableString *holdLine = [NSMutableString string];
+            for (NSString *why in @[@"锁定", @"真后台"]) {
+                NSArray *names = groups[why];
+                if (names.count == 0) continue;
+                NSUInteger show = MIN(names.count, 4u);
+                [holdLine appendFormat:@"· %@ %lu 个：%@%@\n", why, (unsigned long)names.count,
                  [[names subarrayWithRange:NSMakeRange(0, show)] componentsJoinedByString:@"、"],
                  names.count > show ? @"…" : @""];
             }
+            if (groups[@"系统"].count > 0) {
+                [holdLine appendFormat:@"· 系统 %lu 个（不清理）\n", (unsigned long)groups[@"系统"].count];
+            }
+            if (groups[@"自身"].count > 0) {
+                [holdLine appendFormat:@"· 本 App 自身 %lu 个\n", (unsigned long)groups[@"自身"].count];
+            }
 
             if (cands.count == 0) {
-                // 说清「为什么没有」——这个 App 是否在跑、跑着为什么不算可清理，
-                // 都比干巴巴一句「无需加速」有用。
+                // 现在没有内存门槛了，候选为空只可能是「跑着的都受保护」。
                 NSString *msg = nil;
-                if (lockLine.length) {
-                    msg = [lockLine stringByAppendingString:
-                           (aliveOthers > 0
-                            ? [NSString stringWithFormat:@"其余 %lu 个后台占用都很小（不足 8MB），清理收益可以忽略。",
-                               (unsigned long)aliveOthers]
-                            : @"除此之外没有可清理的后台进程。")];
-                } else if (aliveOthers > 0) {
+                if (holdLine.length) {
                     msg = [NSString stringWithFormat:
-                           @"后台有 %lu 个 App 在跑，但每个占用都不到 8MB。\n"
-                           @"这点内存清掉也不会变快，系统随时会自己回收。",
-                           (unsigned long)aliveOthers];
+                           @"后台在跑的都受保护，没有可清理的：\n\n%@", holdLine];
                 } else {
                     msg = @"当前没有第三方 App 在后台运行。\n系统 App 不在清理范围内。";
                 }
@@ -969,13 +1029,18 @@ static UIColor *RBLock(void)   { return [UIColor colorWithRed:1.00 green:0.78 bl
                 }
             }
             if (cands.count > shown) {
-                [list appendFormat:@"… 另有 %lu 个", (unsigned long)(cands.count - shown)];
+                [list appendFormat:@"… 另有 %lu 个\n", (unsigned long)(cands.count - shown)];
+            }
+
+            NSString *msg = [NSString stringWithFormat:@"预计释放约 %@\n\n%@",
+                             RBHumanMB(est), list];
+            if (holdLine.length) {
+                msg = [msg stringByAppendingFormat:@"\n保留不动：\n%@", holdLine];
             }
 
             UIAlertController *ac = [UIAlertController
                 alertControllerWithTitle:[NSString stringWithFormat:@"将结束 %lu 个后台进程", (unsigned long)cands.count]
-                                 message:[NSString stringWithFormat:@"%@预计释放约 %@\n\n%@",
-                                          lockLine, RBHumanMB(est), list]
+                                 message:msg
                           preferredStyle:UIAlertControllerStyleAlert];
             [ac addAction:[UIAlertAction actionWithTitle:@"取消" style:UIAlertActionStyleCancel handler:nil]];
             [ac addAction:[UIAlertAction actionWithTitle:@"开始加速" style:UIAlertActionStyleDestructive

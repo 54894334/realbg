@@ -110,13 +110,16 @@ boost = read("RBBooster.m")
 boost_code = strip_comments(boost)
 m = re.search(r"RBMinWorthMB\s*=\s*([\d.]+)", boost_code)
 thresh = float(m.group(1)) if m else None
-check(thresh == 8.0, "跳过占用 < 8MB 的进程", "（源码阈值 %s）" % thresh)
-check("if (protect && [protect containsObject:bid]) return NO;" in boost_code,
-      "真后台/锁定名单在候选阶段就排除")
-check("if ([sysNames containsObject:bid]) return NO;" in boost_code, "系统应用不杀")
-check("if ([RBProcesses isSystemBundle:bid]) return NO;" in boost_code,
+check(thresh == 0.0, "没有内存门槛（挂起的 App footprint 只有个位数，按大小过滤会漏杀）",
+      "（源码阈值 %s）" % thresh)
+check('return @"系统";' in boost_code and "[sysNames containsObject:bid]" in boost_code,
+      "系统应用不杀")
+check("[RBProcesses isSystemBundle:bid]" in boost_code and 'return @"系统";' in boost_code,
       "com.apple.* 在候选阶段就被排除")
-check("if (pid <= 0 || pid == getpid()) return NO;" in boost_code, "跳过非法 pid 与自身")
+check('return @"真后台";' in boost_code and "if (protect && [protect containsObject:bid])" in boost_code,
+      "真后台/锁定名单在候选阶段就排除")
+check('if (pid <= 0) return @"已退出";' in boost_code and 'if (pid == getpid()) return @"自身";' in boost_code,
+      "跳过非法 pid 与自身")
 check("usleep(500 * 1000)" in boost_code, "杀完等待 500ms 再读内存（避免读到旧值）")
 check("ri_phys_footprint" in boost_code, "单进程占用用 phys_footprint（真实值）")
 
@@ -127,7 +130,7 @@ procs = [
     ("cn.bswbw.RealBG", 40.0),
     ("com.tencent.xinWeChat", 480.0),
     ("com.apple.mobilesafari", 300.0),
-    ("com.zhiliaoapp.musically", 6.0),      # 太小，应跳过
+    ("com.zhiliaoapp.musically", 6.0),      # 1.4.0 起不再按大小跳过
     ("com.example.backstage", 260.0),       # 在真后台白名单，应跳过
     ("com.netease.cloudmusic", 120.0),
 ]
@@ -140,11 +143,11 @@ for bid, mb in procs:
         continue
     if bid in protect:            # 真后台白名单
         continue
-    if mb < thresh:               # 太小
+    if mb < thresh:               # 门槛已归零，这条实际不会命中
         continue
     kept.append(bid)
-expect = ["com.tencent.xinWeChat", "com.netease.cloudmusic"]
-check(kept == expect, "候选集正确（只留真该杀的）", "→ %s" % kept)
+expect = ["com.tencent.xinWeChat", "com.zhiliaoapp.musically", "com.netease.cloudmusic"]
+check(kept == expect, "候选集正确（6MB 的也留，只排除系统/自身/保护名单）", "→ %s" % kept)
 
 print("\n== 3.5 本轮修掉的问题（每条都是源码里可验证的守卫） ==")
 root_src = {f: strip_comments(read(f)) for f in sorted(os.listdir(SRC)) if f.endswith((".m", ".h"))}
@@ -253,7 +256,8 @@ check("@\"锁定保留\"" in vc and "@\"取消锁定\"" in vc, "右滑有「锁�
 check("加速时保留" in vc, "详情菜单里也有一键锁定")
 check('@[@"全部", @"运行", @"保活", @"自启", @"锁定"]' in vc, "分段里有「锁定」页")
 check("self.tab == 4 && !i.locked" in vc, "「锁定」页只列已锁定的")
-check("已锁定跳过" in vc, "加速前的弹窗明确写「已锁定跳过 N 个」")
+check("保留不动：" in vc and 'for (NSString *why in @[@"锁定", @"真后台"])' in vc,
+      "加速前的弹窗明确写「保留不动：锁定 N 个 / 真后台 N 个」")
 check("锁定保留 %lu 个" in vc, "加速结果里也报锁定保留数量")
 check("info.locked" in vc and "已锁定，先取消锁定" in vc, "锁定项手动「杀后台」也会被拦")
 
@@ -305,7 +309,9 @@ check("<key>UIRequiresFullScreen</key>" not in ipl,
       "去掉 UIRequiresFullScreen（iPad 上强制四方向，只声明竖屏会断言崩溃）")
 check("UISupportedInterfaceOrientations~ipad" in ipl, "iPad 单独声明四个方向")
 check("LSSupportsOpeningDocumentsInPlace" in ipl, "文件 App 可直接打开日志目录")
-check("<string>1.3.0</string>" in ipl, "Info.plist 版本 1.3.0")
+_ver = re.search(r'#define\s+RB_VERSION\s+@"([\d.]+)"', read("RB.h")).group(1)
+check("<string>%s</string>" % _ver in ipl,
+      "Info.plist 版本与 RB_VERSION 一致（%s）" % _ver)
 
 print("\n== 12. 1.2.0：消除「点开秒退」的全部已知成因 ==")
 mk_code = "\n".join(l.split("#")[0] for l in mk.split("\n"))
@@ -403,7 +409,7 @@ check("dynamic_lookup" not in mk_code,
 print("\n== 14. 1.3.0：加速真的杀掉了，界面也真的跟着变 ==")
 # 三个现场问题：
 #   ① 加速后目标仍在「运行中」列表里            → kill() 返回值 ≠ 进程已死
-#   ② 再点一键加速却说「无需加速」              → 复活进程占用小，被 8MB 门槛漏掉
+#   ② 再点一键加速却说「无需加速」              → 复活进程占用小，被大小门槛漏掉
 #   ③ 列表一直转圈                              → reload 数据被旧结果覆盖 / 转圈语义不清
 
 pr_c = strip_comments(root_src["RBProcesses.m"])
@@ -426,7 +432,7 @@ check("+ (NSArray<NSDictionary *> *)revivedFrom:(NSSet *)killedIDs" in bo_c,
 _rv = bo_c[bo_c.index("+ (NSArray<NSDictionary *> *)revivedFrom:"):]
 _rv = _rv[:_rv.index("+ (NSDictionary *)boostProtecting:")]
 check("RBMinWorthMB" not in _rv,
-      "复扫不设 8MB 门槛（复活初期占用很小，设门槛就会「列表还在跑但说无需加速」）")
+      "复扫不设内存门槛（复活初期占用很小，设门槛就会「列表还在跑但说无需加速」）")
 check("NSDictionary *finalRunning = [RBProcesses runningPids];" in bo_c,
       "终局校验：全轮跑完再扫一遍，还活着的从成功列表里剔除")
 check("@\"relaunched\"" in bo_c, "结果里区分「结束」与「被系统重新拉起」")
@@ -442,9 +448,38 @@ check("self.appliedSeq = ++self.reloadSeq;" in vc_c,
 check("if (seq < self.appliedSeq)" in vc_c, "reload 结果按序号判过期，过期整份丢弃")
 check("UIActivityIndicatorView" not in vc_c,
       "不再用转圈表示运行中（转圈没有「已结束」的语义，会让人以为一直没杀成）")
-check("后台有 %lu 个 App 在跑，但每个占用都不到 8MB" in vc_c,
+check("后台在跑的都受保护，没有可清理的" in vc_c,
       "候选为空时说清原因，不再只丢一句「无需加速」")
 check("被系统重新拉起，已清 %lu 轮" in vc_c, "结果弹窗如实报「被重新拉起」的数量")
+
+print("\n== 15. 1.4.0：「运行列表五个 App 只清两个」=")
+# 现场：运行页有明显的 7 个 App，加速弹窗只列微信 + TrollStore。
+# 根因是候选阶段的 8MB 门槛把挂起的 App 全挡掉了（挂起进程 footprint 只有个位数）。
+check(thresh == 0.0, "候选不再有内存门槛（8MB 挡掉了所有挂起的 App）")
+check("+ (NSString *)skipReasonForBundle:(NSString *)bid" in bo_c,
+      "所有过滤理由收敛到一个函数，避免各调用点判定不一致")
+check('return @"锁定";' in bo_c, "跳过原因区分「锁定」")
+check('return @"真后台";' in bo_c, "跳过原因区分「真后台」")
+check('return @"系统";' in bo_c, "跳过原因区分「系统」")
+check("+ (NSArray<NSDictionary *> *)protectedRunningProtecting:(NSSet *)protect" in bo_c,
+      "能列出「运行中但不会清理」的进程及原因")
+check("+ (BOOL)isBoostableBundle:(NSString *)bundleID protect:(NSSet *)protect" in bo_c,
+      "界面能直接问「这个 App 会被清理吗」")
+
+# 界面：列表显示实时占用 + 系统 App 标「系统」
+check("_memLabel" in vc_c, "单元格多一行显示实时占用")
+check('info.isSystem ? @"系统" : @"运行中"' in vc_c,
+      "系统 App 不再一律写「运行中」（用户正是看到它才问为什么不清理）")
+check("[RBBooster usageForPid:i.pid]" in vc_c, "列表里的占用来自实时 rusage，不是估值常量")
+check("保留不动：" in vc_c, "加速前弹窗列出「保留不动」的 App 及原因")
+check("groups[@\"系统\"]" in vc_c, "系统 App 只报个数，不逐个列名")
+
+# 编译层面：新加的类方法必须有实现（1.2.0 的教训：只有声明没有实现 = 秒退）
+for _sig in ("+ (NSDictionary *)usageForPid:(pid_t)pid {",
+             "+ (NSString *)skipReasonForBundle:(NSString *)bid",
+             "+ (BOOL)isBoostableBundle:(NSString *)bundleID protect:(NSSet *)protect {",
+             "+ (NSArray<NSDictionary *> *)protectedRunningProtecting:(NSSet *)protect {"):
+    check(_sig in bo_c, "RBBooster 已实现 %s" % _sig.split("(")[0].strip())
 
 # 图标：1.3.0 换成了仪表环方案，三档尺寸都要在
 import struct as _st
