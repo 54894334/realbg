@@ -110,7 +110,7 @@ jobs:
 
       - name: 产物硬校验
         run: |
-          python3 tests/verify_tipa.py RealBG.tipa --app RealBG --bundle cn.bswbw.RealBG --version 1.2.0
+          python3 tests/verify_tipa.py RealBG.tipa --app RealBG --bundle cn.bswbw.RealBG --version 1.3.0
           # 探针包只有 2 条权限，用完整清单去要求它不合适，加 --lite 走简化断言
           python3 tests/verify_tipa.py RealBGLite.tipa --app RealBGLite --bundle cn.bswbw.RealBGLite --version 1.0 --lite
 
