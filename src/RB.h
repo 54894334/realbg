@@ -14,7 +14,7 @@
 #import <UIKit/UIKit.h>
 #import <Foundation/Foundation.h>
 
-#define RB_VERSION @"1.4.1"
+#define RB_VERSION @"1.4.2"
 #define RB_BUNDLE @"cn.bswbw.RealBG"
 
 // 配置：/var/mobile/Library/Preferences/cn.bswbw.RealBG.plist

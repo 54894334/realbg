@@ -80,6 +80,12 @@
     <true/>
     <key>com.apple.runningboard.assertions.frontboard</key>
     <true/>
+    <!-- ★ v1.4.2 补回（原包 1.5 有，1.4.1 砍了导致 assertion 全失败）：
+         域属性断言的获取与传递要靠这两条，配合 Info.plist 的 BSServiceDomains。 -->
+    <key>com.apple.runningboard.primitiveattribute</key>
+    <true/>
+    <key>com.apple.runningboard.hereditarygrantoriginator</key>
+    <true/>
 
     <!-- 只读文件：读别的 App 的 Info.plist。写文件不在这里开 -->
     <key>file-read-data</key>

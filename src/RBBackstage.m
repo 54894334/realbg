@@ -152,6 +152,10 @@ static void RBInstallSceneWindowHooksIfNeeded(void) {
 @property (nonatomic, strong) NSMutableDictionary<NSString *, id> *assertions;  // bid -> RBSAssertion
 @property (nonatomic, strong) NSMutableDictionary<NSString *, NSNumber *> *pids; // bid -> pid
 @property (nonatomic, strong) id binder;
+/// v1.4.2：scene / assertion 各自失败到最后一步的原因，弹窗直接告诉用户，
+/// 不再只给一句「scene 与 assertion 都失败了」让人干瞪眼。
+@property (nonatomic, copy) NSString *lastSceneReason;
+@property (nonatomic, copy) NSString *lastAssertionReason;
 @end
 
 @implementation RBBackstage
@@ -225,8 +229,11 @@ static void RBInstallSceneWindowHooksIfNeeded(void) {
         return YES;
     }
     if (error) {
+        NSString *why = [NSString stringWithFormat:@"scene：%@；assertion：%@",
+                         self.lastSceneReason ?: @"未知",
+                         self.lastAssertionReason ?: @"未知"];
         *error = [NSError errorWithDomain:@"RealBG" code:1
-                                 userInfo:@{NSLocalizedDescriptionKey: @"scene 与 assertion 都失败了"}];
+                                 userInfo:@{NSLocalizedDescriptionKey: why}];
     }
     return NO;
 }
@@ -243,6 +250,7 @@ static void RBInstallSceneWindowHooksIfNeeded(void) {
     Class csetCls = NSClassFromString(@"UIMutableApplicationSceneClientSettings");
     if (!defCls || !mgrCls || !specCls || !parCls) {
         RBLog(@"FrontBoard scene 相关类缺失");
+        self.lastSceneReason = @"FrontBoard scene 相关类缺失（iOS 版本差异）";
         return NO;
     }
 
@@ -251,19 +259,26 @@ static void RBInstallSceneWindowHooksIfNeeded(void) {
         NSString *sceneID = [NSString stringWithFormat:@"realbg.%@", bundleID];
 
         id def = RBMsg0(defCls, @"definition");
-        if (!def) return NO;
+        if (!def) {
+            self.lastSceneReason = @"+definition 取不到（FBSMutableSceneDefinition 变了）";
+            return NO;
+        }
         [def setValue:RBMsg1(idCls, @"identityForIdentifier:", sceneID) forKey:@"identity"];
         [def setValue:RBMsg1(cidCls, @"identityForEmbeddedApplicationIdentifier:", bundleID)
                forKey:@"clientIdentity"];
         id spec = RBMsg0(specCls, @"specification");
         if (!spec) {
             RBLog(@"UIApplicationSceneSpecification 取不到");
+            self.lastSceneReason = @"UIApplicationSceneSpecification 取不到";
             return NO;
         }
         [def setValue:spec forKey:@"specification"];
 
         id params = RBMsg1(parCls, @"parametersForSpecification:", spec);
-        if (!params) return NO;
+        if (!params) {
+            self.lastSceneReason = @"parametersForSpecification: 返回 nil";
+            return NO;
+        }
 
         // settings：让它以「前台」姿态运行，并忽略遮挡导致的降级
         if (setCls) {
@@ -279,17 +294,22 @@ static void RBInstallSceneWindowHooksIfNeeded(void) {
         }
 
         id mgr = RBMsg0(mgrCls, @"sharedInstance");
-        if (!mgr) return NO;
+        if (!mgr) {
+            self.lastSceneReason = @"FBSceneManager.sharedInstance 取不到";
+            return NO;
+        }
         scene = ((id (*)(id, SEL, id, id))objc_msgSend)(
             mgr, NSSelectorFromString(@"createSceneWithDefinition:initialParameters:"), def, params);
         if (!scene) {
             RBLog(@"createScene 返回 nil：%@", bundleID);
+            self.lastSceneReason = @"createScene 返回 nil";
             return NO;
         }
 
         id binder = [self ensureBinder];
         if (!binder || ![binder respondsToSelector:NSSelectorFromString(@"addScene:")]) {
             RBLog(@"binder 不可用，scene 无法上屏（回收刚创建的 scene）");
+            self.lastSceneReason = @"窗口 binder 不可用，scene 挂不上屏";
             [self destroyScene:scene];          // 不回收就是一条泄漏的 scene
             return NO;
         }
@@ -300,6 +320,7 @@ static void RBInstallSceneWindowHooksIfNeeded(void) {
         return YES;
     } @catch (NSException *e) {
         RBLog(@"scene 方案异常：%@ %@", e.name, e.reason);
+        self.lastSceneReason = [NSString stringWithFormat:@"异常：%@", e.reason];
         if (scene) [self destroyScene:scene];
         return NO;
     }
@@ -322,35 +343,69 @@ static void RBInstallSceneWindowHooksIfNeeded(void) {
     if (pid <= 0) {
         pid = [[RBProcesses runningPids][bundleID] intValue];
     }
-    if (pid <= 0) return NO;
+    if (pid <= 0) {
+        self.lastAssertionReason = @"拿不到目标进程 pid（先打开它再开真后台）";
+        return NO;
+    }
 
     Class attrCls = NSClassFromString(@"RBSDomainAttribute");
     Class tgtCls = NSClassFromString(@"RBSTarget");
     Class asCls = NSClassFromString(@"RBSAssertion");
-    if (!attrCls || !tgtCls || !asCls) return NO;
-
-    @try {
-        id attr = ((id (*)(id, SEL, id, id))objc_msgSend)(
-            attrCls, NSSelectorFromString(@"attributeWithDomain:name:"),
-            @"com.apple.frontboard", @"Background");
-        id target = ((id (*)(id, SEL, int))objc_msgSend)(tgtCls, NSSelectorFromString(@"targetWithPid:"), pid);
-        id assertion = ((id (*)(id, SEL, id, id, id))objc_msgSend)(
-            ((id (*)(id, SEL))objc_msgSend)(asCls, @selector(alloc)),
-            NSSelectorFromString(@"initWithExplanation:target:attributes:"),
-            [NSString stringWithFormat:@"RealBG backstage for %@", bundleID],
-            target, @[attr]);
-        NSError *err = nil;
-        BOOL ok = ((BOOL (*)(id, SEL, NSError **))objc_msgSend)(
-            assertion, NSSelectorFromString(@"acquireWithError:"), &err);
-        if (ok) {
-            @synchronized (self) { self.assertions[bundleID] = assertion; }
-            RBLog(@"真后台(assertion) 已保活：%@", bundleID);
-        } else {
+    if (!attrCls || !tgtCls || !asCls) {
+        self.lastAssertionReason = @"RunningBoard 类不可用";
+    } else {
+        @try {
+            id attr = ((id (*)(id, SEL, id, id))objc_msgSend)(
+                attrCls, NSSelectorFromString(@"attributeWithDomain:name:"),
+                @"com.apple.frontboard", @"Background");
+            id target = ((id (*)(id, SEL, int))objc_msgSend)(tgtCls, NSSelectorFromString(@"targetWithPid:"), pid);
+            id assertion = ((id (*)(id, SEL, id, id, id))objc_msgSend)(
+                ((id (*)(id, SEL))objc_msgSend)(asCls, @selector(alloc)),
+                NSSelectorFromString(@"initWithExplanation:target:attributes:"),
+                [NSString stringWithFormat:@"RealBG backstage for %@", bundleID],
+                target, @[attr]);
+            NSError *err = nil;
+            BOOL ok = ((BOOL (*)(id, SEL, NSError **))objc_msgSend)(
+                assertion, NSSelectorFromString(@"acquireWithError:"), &err);
+            if (ok) {
+                @synchronized (self) { self.assertions[bundleID] = assertion; }
+                RBLog(@"真后台(assertion) 已保活：%@", bundleID);
+                self.lastAssertionReason = nil;
+                return YES;
+            }
             RBLog(@"assertion 获取失败：%@", err.localizedDescription);
+            self.lastAssertionReason = [NSString stringWithFormat:@"RunningBoard 拒绝：%@",
+                                        err.localizedDescription ?: @"未知"];
+        } @catch (NSException *e) {
+            RBLog(@"assertion 异常：%@", e.reason);
+            self.lastAssertionReason = [NSString stringWithFormat:@"RunningBoard 异常：%@", e.reason];
         }
-        return ok;
+    }
+
+    // v1.4.2：RBS 拒绝（权限/域声明问题）时退回老的 BKSProcessAssertion ——
+    // 这是 RunningBoard 出现之前 FrontBoard 就有的断言接口，走 backboardd，
+    // 对目标 pid 同样有效。RBS 的原因（域声明）修好后走不到这里。
+    @try {
+        Class bks = NSClassFromString(@"BKSProcessAssertion");
+        if (!bks) return NO;
+        id raw = ((id (*)(id, SEL))objc_msgSend)((id)bks, @selector(alloc));
+        SEL s = NSSelectorFromString(@"initWithPID:flags:reason:name:");
+        if (![raw respondsToSelector:s]) {
+            RBLog(@"BKS 接口签名变了，断言兜底不可用");
+            return NO;
+        }
+        id a = ((id (*)(id, SEL, int, unsigned int, unsigned int, id))objc_msgSend)(
+            raw, s, (int)pid, (unsigned int)0x1F, (unsigned int)1,
+            [NSString stringWithFormat:@"RealBG backstage %@", bundleID]);
+        SEL ac = NSSelectorFromString(@"acquire");
+        if (![a respondsToSelector:ac]) return NO;
+        ((void (*)(id, SEL))objc_msgSend)(a, ac);
+        @synchronized (self) { self.assertions[bundleID] = a; }
+        self.lastAssertionReason = nil;
+        RBLog(@"真后台(BKS assertion) 已保活：%@ pid=%d", bundleID, pid);
+        return YES;
     } @catch (NSException *e) {
-        RBLog(@"assertion 异常：%@", e.reason);
+        RBLog(@"BKS assertion 异常：%@", e.reason);
         return NO;
     }
 }

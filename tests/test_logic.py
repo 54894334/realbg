@@ -206,7 +206,10 @@ check("writeToFile:legacy" not in clean_store, "不写旧路径")
 
 print("\n== 6. entitlements 数量与危险项 ==")
 ents = plistlib.load(open(os.path.join(ROOT, "entitlements.plist"), "rb"))
-check(len(ents) == 18, "权限条数 = 18", "（实际 %d）" % len(ents))
+check(len(ents) == 20, "权限条数 = 20（1.4.2 补回 primitiveattribute / hereditarygrantoriginator）", "（实际 %d）" % len(ents))
+check("com.apple.runningboard.primitiveattribute" in ents and
+      "com.apple.runningboard.hereditarygrantoriginator" in ents,
+      "带 RunningBoard 两条域属性权限（1.4.1 砍掉导致 assertion 全失败）")
 check("com.apple.private.security.no-container" not in ents,
       "不带 no-container（原包 1.5 没有这条；带上就没有沙盒容器，与 platform-application 组合更危险）")
 check("com.apple.backboard.client" in ents,

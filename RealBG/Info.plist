@@ -17,9 +17,9 @@
     <key>CFBundlePackageType</key>
     <string>APPL</string>
     <key>CFBundleShortVersionString</key>
-    <string>1.4.1</string>
+    <string>1.4.2</string>
     <key>CFBundleVersion</key>
-    <string>7</string>
+    <string>8</string>
 
     <!-- 标明这是 iOS 应用。缺这一项时有的安装路径会判定成非法包 -->
     <key>CFBundleSupportedPlatforms</key>
@@ -69,6 +69,31 @@
 
     <key>UIApplicationSupportsIndirectInputEvents</key>
     <true/>
+
+    <!-- ★ v1.4.2 关键修复：RunningBoard 域声明。
+         RBSAssertion 用 attributeWithDomain:@"com.apple.frontboard" name:@"Background"
+         请求断言时，runningboardd 会到本进程 Info.plist 的 BSServiceDomains 里查
+         这个域的声明（报错「Could not find attribute name in domain plist」说的
+         就是这里）。原包 1.5 有这一段，我们重构版没有，所以 assertion 一次都没成功过。 -->
+    <key>BSServiceDomains</key>
+    <dict>
+        <key>com.apple.frontboard</key>
+        <dict>
+            <key>DerivedServiceRestrictions</key>
+            <array>
+                <string>com.apple.uis.applicationStateService</string>
+                <string>com.apple.uis.applicationSupportService</string>
+                <string>com.apple.frontboard.layout-monitor</string>
+            </array>
+            <key>Services</key>
+            <dict>
+                <key>com.apple.frontboard.system-service</key>
+                <dict/>
+                <key>com.apple.frontboard.workspace-service</key>
+                <dict/>
+            </dict>
+        </dict>
+    </dict>
 
     <!-- 让日志和崩溃记录出现在「文件」App → 我的 iPhone → 真后台 Pro，
          用户可以直接分享出来，不用连电脑。 -->
