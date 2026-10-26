@@ -55,8 +55,9 @@ MUST_NOT_HAVE = [
     "com.apple.private.hid.client.service-protected",
     "com.apple.private.hid.manager.client",
     "com.apple.private.allow-background-haptics",
-    "com.apple.runningboard.hereditarygrantoriginator",
-    "com.apple.runningboard.primitiveattribute",
+    # 1.4.2 起补回 primitiveattribute / hereditarygrantoriginator（原包 1.5 有）：
+    # 没有这两条 + Info.plist 的 BSServiceDomains 域声明，RunningBoard 断言
+    # 全部被拒（「Could not find attribute name in domain plist」）。
     # 加了 no-container 就没有沙盒容器了。原包 1.5 根本没有这一条，
     # TrollStore 官方也说明 no-sandbox 单独就够（第三个是推荐项）。
     "com.apple.private.security.no-container",
